@@ -5,6 +5,8 @@
  * - lib/script_models.py (NarrationSegment, DramaScene, ImagePrompt, VideoPrompt, etc.)
  */
 
+import type { ReferenceScriptPlanDraft, ScriptReviewQuarantine } from "./reference-video";
+
 export const SHOT_TYPES = [
   "Extreme Close-up",
   "Close-up",
@@ -19,6 +21,18 @@ export const SHOT_TYPES = [
 
 export type ShotType = (typeof SHOT_TYPES)[number];
 
+export const SHOT_TYPE_I18N_KEYS: Record<ShotType, string> = {
+  "Extreme Close-up": "shot_type_extreme_close_up",
+  "Close-up": "shot_type_close_up",
+  "Medium Close-up": "shot_type_medium_close_up",
+  "Medium Shot": "shot_type_medium_shot",
+  "Medium Long Shot": "shot_type_medium_long_shot",
+  "Long Shot": "shot_type_long_shot",
+  "Extreme Long Shot": "shot_type_extreme_long_shot",
+  "Over-the-shoulder": "shot_type_over_the_shoulder",
+  "Point-of-view": "shot_type_point_of_view",
+};
+
 export const CAMERA_MOTIONS = [
   "Static",
   "Pan Left",
@@ -27,18 +41,154 @@ export const CAMERA_MOTIONS = [
   "Tilt Down",
   "Zoom In",
   "Zoom Out",
+  "Push In",
+  "Pull Out",
+  "Truck Left",
+  "Truck Right",
+  "Pedestal Up",
+  "Pedestal Down",
+  "Orbit",
   "Tracking Shot",
+  "Shake",
 ] as const;
 
 export type CameraMotion = (typeof CAMERA_MOTIONS)[number];
 
+export const CAMERA_MOTION_I18N_KEYS: Record<CameraMotion, string> = {
+  Static: "camera_motion_static",
+  "Pan Left": "camera_motion_pan_left",
+  "Pan Right": "camera_motion_pan_right",
+  "Tilt Up": "camera_motion_tilt_up",
+  "Tilt Down": "camera_motion_tilt_down",
+  "Zoom In": "camera_motion_zoom_in",
+  "Zoom Out": "camera_motion_zoom_out",
+  "Push In": "camera_motion_push_in",
+  "Pull Out": "camera_motion_pull_out",
+  "Truck Left": "camera_motion_truck_left",
+  "Truck Right": "camera_motion_truck_right",
+  "Pedestal Up": "camera_motion_pedestal_up",
+  "Pedestal Down": "camera_motion_pedestal_down",
+  Orbit: "camera_motion_orbit",
+  "Tracking Shot": "camera_motion_tracking_shot",
+  Shake: "camera_motion_shake",
+};
+
 export type TransitionType = "cut" | "fade" | "dissolve";
-export type DurationSeconds = 4 | 6 | 8;
+export type DurationSeconds = number;
 export type AssetStatus = "pending" | "storyboard_ready" | "completed";
 
 export interface Dialogue {
   speaker: string;
   line: string;
+}
+
+export type UtteranceKind = "dialogue" | "voiceover";
+
+/**
+ * Drama 分镜级有序发声条目，判别式联合（discriminated union）按 kind 收窄，把 kind ⇄ speaker
+ * 约束编码进类型：dialogue 必带非空 speaker、voiceover 不得带 speaker。非法组合（dialogue 缺
+ * speaker、voiceover 带 speaker）编译期即被拒，与后端 Utterance 契约一致。
+ */
+export interface DialogueUtterance {
+  kind: "dialogue";
+  /** 角色台词必带非空说话人。 */
+  speaker: string;
+  text: string;
+}
+
+export interface VoiceoverUtterance {
+  kind: "voiceover";
+  /** 无说话人画外音：speaker 恒为 null 或缺省。 */
+  speaker?: null;
+  text: string;
+}
+
+export type Utterance = DialogueUtterance | VoiceoverUtterance;
+
+/**
+ * script_plan 结构化中间态（内容确认的可审 / 可改对象）。映射后端 lib/script_models.py 的
+ * DramaSceneContent / DramaNormalizedScript 与 NarrationScriptPlanSegment / NarrationScriptPlanDraft：
+ * script_plan 已定内容层，prompt_authoring 视觉生成（image_prompt / video_prompt）由用户确认后才触发。
+ */
+export interface DramaSceneContent {
+  scene_id: string;
+  duration_seconds: number;
+  segment_break: boolean;
+  characters_in_scene: string[];
+  scenes: string[];
+  props: string[];
+  /** 视觉改编自由文本（供 prompt_authoring 生成画面，不内嵌口播）。 */
+  scene_description: string;
+  /** 分镜级有序发声序列：台词 / 画外音按时序排列（内容确认的富编辑对象）。 */
+  utterances: Utterance[];
+  /** 逐字原文摘录（追溯锚，不朗读、不出音）。 */
+  source_text: string;
+}
+
+export interface DramaNormalizedScript {
+  title: string;
+  scenes: DramaSceneContent[];
+}
+
+export interface NarrationScriptPlanSegment {
+  segment_id: string;
+  /** 小说原文（逐字保留，内容确认的可编辑对象）。 */
+  novel_text: string;
+  duration_seconds: number;
+  segment_break: boolean;
+  characters_in_segment: string[];
+  scenes: string[];
+  props: string[];
+}
+
+export interface NarrationScriptPlanDraft {
+  segments: NarrationScriptPlanSegment[];
+  episode?: number;
+}
+
+export type ScriptReviewStatus =
+  | "not_applicable"
+  | "no_script_plan"
+  | "pending_review"
+  | "confirmed";
+
+/** 内容确认将覆盖的正式脚本：旧分镜全部移除，列出每条分镜名下已生成的产物。 */
+export interface ScriptOverwrite {
+  /** 被列出的这份正式脚本的版本；认可覆盖时原样回传，正式脚本之后又有变化则按新清单再次拒绝。 */
+  revision: string;
+  entries: { id: string; has_storyboard: boolean; has_video: boolean }[];
+  storyboard_count: number;
+  video_count: number;
+}
+
+/** script_plan→prompt_authoring 内容确认状态（后端 server/routers/script_review.py 的 GET 响应）。 */
+export interface ScriptReviewState {
+  episode: number;
+  content_mode: string | null;
+  status: ScriptReviewStatus;
+  fingerprint: string | null;
+  confirmed_at: string | null;
+  content: DramaNormalizedScript | NarrationScriptPlanDraft | ReferenceScriptPlanDraft | null;
+  /** 草稿在场时非 null（三条 script_plan 路线都可能出现），否则 null。 */
+  quarantine: ScriptReviewQuarantine | null;
+  /**
+   * unit 时长可选档位，reference_video 变体才非 null（项目未配置视频型号而解析不到时也为
+   * null，呈现层退回只读秒数）。与后端读时迁移收编所用的是同一份档位表——结构区间全集，不
+   * 含分辨率 / 参考图联动约束。
+   */
+  supported_durations: number[] | null;
+  /**
+   * 按「是否带参考图」收窄后的逐 unit 生效档位，与 prompt_authoring 落盘前的校验同一把尺；无法解析型号
+   * 时为 null，呈现层退回 `supported_durations` 的未收窄全集。
+   */
+  duration_tiers: { with_references: number[]; without_references: number[] } | null;
+  /**
+   * 项目级「单集目标时长」偏好（秒），未设时 null。审核面板据它渲染「本集合计 / 目标」对比；
+   * 超出目标只提示，不阻断确认与后续生成。
+   */
+  episode_target_duration: number | null;
+  /** 确认将覆盖的正式脚本；该集尚无正式脚本时 null。非 null 时确认须带其 `revision` 认可覆盖。 */
+  script_overwrite: ScriptOverwrite | null;
 }
 
 export interface Composition {
@@ -61,9 +211,13 @@ export interface VideoPrompt {
 
 export interface GeneratedAssets {
   storyboard_image: string | null;
+  storyboard_last_image: string | null;  // grid mode last frame
+  grid_id: string | null;                // source grid ID
+  grid_cell_index: number | null;        // cell index in source grid
   video_clip: string | null;
   video_thumbnail: string | null;
   video_uri: string | null;
+  narration_audio?: string | null;       // narration audio file path
   status: AssetStatus;
 }
 
@@ -74,26 +228,52 @@ export interface NarrationSegment {
   segment_break: boolean;
   novel_text: string;
   characters_in_segment: string[];
-  clues_in_segment: string[];
-  image_prompt: ImagePrompt | string;
-  video_prompt: VideoPrompt | string;
+  scenes?: string[];
+  props?: string[];
+  /** `null` = 待编写：内容确认转出的正式脚本只有内容层，提示词尚未编写。 */
+  image_prompt: ImagePrompt | string | null;
+  video_prompt: VideoPrompt | string | null;
   transition_to_next: TransitionType;
   note?: string;
+  /**
+   * 尾帧快照路径（项目内相对路径）。视频从分镜图开场、过渡到这张图收尾。
+   * 只由 /end-frame 的设置/清除端点写入——通用剧本 PATCH 刻意不接受该字段，
+   * 避免绕过快照复制写出悬空引用（见 server/routers/end_frames.py）。
+   */
+  end_frame_image?: string | null;
   generated_assets?: GeneratedAssets;
+  /** 待编写：视觉层尚未由提示词编写补出。新增条目时置位、提示词编写写回后清除，只读。 */
+  pending_authoring?: boolean;
 }
 
 export interface DramaScene {
   scene_id: string;
   duration_seconds: DurationSeconds;
   segment_break: boolean;
-  scene_type: string;
   characters_in_scene: string[];
-  clues_in_scene: string[];
-  image_prompt: ImagePrompt | string;
-  video_prompt: VideoPrompt | string;
+  scenes?: string[];
+  props?: string[];
+  /** `null` = 待编写：内容确认转出的正式脚本只有内容层，提示词尚未编写。 */
+  image_prompt: ImagePrompt | string | null;
+  video_prompt: VideoPrompt | string | null;
+  /**
+   * 分镜级有序发声序列：角色台词与画外音按时序排列。新结构（drama）；
+   * 存量 drama 走后端读时迁移，前端读到时此字段可能缺省。
+   */
+  utterances?: Utterance[];
+  /** 对应原文：内容确认时从脚本规划透传，时间线只读；手动新增的分镜为空或缺省。 */
+  source_text?: string;
   transition_to_next: TransitionType;
   note?: string;
+  /**
+   * 尾帧快照路径（项目内相对路径）。视频从分镜图开场、过渡到这张图收尾。
+   * 只由 /end-frame 的设置/清除端点写入——通用剧本 PATCH 刻意不接受该字段，
+   * 避免绕过快照复制写出悬空引用（见 server/routers/end_frames.py）。
+   */
+  end_frame_image?: string | null;
   generated_assets?: GeneratedAssets;
+  /** 待编写：视觉层尚未由提示词编写补出。新增条目时置位、提示词编写写回后清除，只读。 */
+  pending_authoring?: boolean;
 }
 
 /** Novel source information (present in both episode script types). */
@@ -106,8 +286,7 @@ export interface NarrationEpisodeScript {
   episode: number;
   title: string;
   content_mode: "narration";
-  duration_seconds: number;
-  summary: string;
+  schema_version?: number;
   novel: NovelInfo;
   segments: NarrationSegment[];
 }
@@ -116,10 +295,81 @@ export interface DramaEpisodeScript {
   episode: number;
   title: string;
   content_mode: "drama";
-  duration_seconds: number;
-  summary: string;
+  schema_version?: number;
   novel: NovelInfo;
   scenes: DramaScene[];
 }
 
-export type EpisodeScript = NarrationEpisodeScript | DramaEpisodeScript;
+/** 带货框架 section 八值引导（与后端审定配比表用词一致；不硬枚举，允许自定义值）。 */
+export const AD_SECTION_VALUES = [
+  "hook",
+  "pain_point",
+  "product_reveal",
+  "selling_point",
+  "demo",
+  "trust",
+  "price_promo",
+  "cta",
+] as const;
+
+/** 广告/短片分镜（平铺 shots[]，口播文案一等）。 */
+export interface AdShot {
+  shot_id: string;
+  /** 带货框架段落标签（hook/pain_point/... 八值引导，不硬枚举）。 */
+  section: string;
+  duration_seconds: DurationSeconds;
+  /** 口播文案，字幕导出与后续配音的唯一来源。 */
+  voiceover_text: string;
+  characters_in_shot?: string[];
+  scenes?: string[];
+  props?: string[];
+  /** 商品名称引用，非空即商品分镜。 */
+  products_in_shot?: string[];
+  /** 待编写分镜（手动新增）为 null，由提示词编写补出。 */
+  image_prompt: ImagePrompt | string | null;
+  video_prompt: VideoPrompt | string | null;
+  transition_to_next: TransitionType;
+  note?: string;
+  /**
+   * 尾帧快照路径（项目内相对路径）。视频从分镜图开场、过渡到这张图收尾。
+   * 只由 /end-frame 的设置/清除端点写入——通用剧本 PATCH 刻意不接受该字段，
+   * 避免绕过快照复制写出悬空引用（见 server/routers/end_frames.py）。
+   */
+  end_frame_image?: string | null;
+  generated_assets?: GeneratedAssets;
+  /** 待编写：视觉层尚未由提示词编写补出。新增条目时置位、提示词编写写回后清除，只读。 */
+  pending_authoring?: boolean;
+}
+
+export interface AdEpisodeScript {
+  episode: number;
+  title: string;
+  content_mode: "ad";
+  schema_version?: number;
+  novel: NovelInfo;
+  shots: AdShot[];
+}
+
+export type EpisodeScript = NarrationEpisodeScript | DramaEpisodeScript | AdEpisodeScript;
+
+/**
+ * 一侧提示词的最终渲染结果。`text` 与 `unavailable` 恰有一个非 null；
+ * `unavailable` 已是后端按请求语言渲染的成品文案，前端不再二次翻译。
+ */
+export interface RenderedPromptPreview {
+  text: string | null;
+  unavailable: string | null;
+  /** 该条目的这一侧提示词当前是文本形态。 */
+  is_text_form: boolean;
+  /** 渲染这份文本时产生的提示（如参考图超出后端上限被裁剪），已由后端按请求语言渲染成成品文案。 */
+  warnings: string[];
+}
+
+/** 条目最终提示词预览：与执行期同一渲染出口，逐字等于实际发给模型的文本。 */
+export interface ItemPromptPreview {
+  item_id: string;
+  content_mode: "narration" | "drama" | "ad";
+  storyboard_image: RenderedPromptPreview;
+  video: RenderedPromptPreview;
+}
+

@@ -1,0 +1,562 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Copy, Download, ExternalLink, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { API } from "@/api";
+import { errMsg, voidCall } from "@/utils/async";
+import { useAppStore } from "@/stores/app-store";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import {
+  ACCENT_BTN_SM_CLS,
+  ACCENT_BUTTON_STYLE,
+  CARD_STYLE,
+  GHOST_BTN_CLS,
+  INPUT_CLS,
+} from "@/components/ui/darkroom-tokens";
+import type {
+  CustomEndpointInfo,
+  CustomProviderInfo,
+  EndpointDefinition,
+  EndpointDescriptor,
+  EndpointInstallation,
+  EndpointReference,
+  EndpointValidateResponse,
+} from "@/types";
+import { MarketInstallBadges } from "../market/MarketInstallBadges";
+import { MARKET_CONTRIBUTING_URL } from "../market/market-links";
+import { isRenderableDefinition, type EndpointFormSection } from "./endpoint-definition-draft";
+import { EndpointDiagnostics } from "./EndpointDiagnostics";
+import { EndpointReferenceList, endpointReferences } from "./EndpointReferenceList";
+import { EndpointForm } from "./EndpointForm";
+import { EndpointTestSection } from "./EndpointTestSection";
+import { exportEndpointDefinition } from "./export-endpoint-definition";
+import type { AnyEndpointDefinition, ComfyuiEndpointDefinition } from "@/types";
+import { VariableInsertionProvider } from "./endpoint-form-primitives";
+import { ComfyuiEndpointDetail } from "./ComfyuiEndpointDetail";
+import type { ComfyuiImportDraft } from "./comfyui-import";
+
+const VALIDATE_DEBOUNCE_MS = 400;
+
+/**
+ * 选中项：新建草稿、我的声明式端点、我的 ComfyUI 端点、刚导入还没保存的 ComfyUI 草稿、
+ * 内置声明式、内置 Python 六态。
+ */
+export type EndpointSelection =
+  | { mode: "new"; definition: EndpointDefinition }
+  | { mode: "custom"; record: CustomEndpointInfo; definition: EndpointDefinition }
+  | { mode: "comfyui"; record: CustomEndpointInfo; definition: ComfyuiEndpointDefinition }
+  | { mode: "comfyui-draft"; draft: ComfyuiImportDraft }
+  | { mode: "builtin"; descriptor: EndpointDescriptor }
+  | { mode: "python"; descriptor: EndpointDescriptor };
+
+/** 我的端点：两种 kind 共用同一条保存记录，键、安装记录与删除入口都取自它。 */
+function savedRecordOf(selection: EndpointSelection): CustomEndpointInfo | null {
+  return selection.mode === "custom" || selection.mode === "comfyui" ? selection.record : null;
+}
+
+interface EndpointDetailProps {
+  selection: EndpointSelection;
+  providers: CustomProviderInfo[];
+  /** 引用该端点的模型行数量，来自自定义供应商的模型列表。 */
+  referenceCount: number;
+  onSaved: (record: CustomEndpointInfo) => void;
+  onDeleted: () => void;
+  onCopied: (record: CustomEndpointInfo) => void;
+  onCreateProvider: (definition: EndpointDefinition, endpointKey: string) => void;
+  onNavigateToModel: (reference: EndpointReference) => void;
+  /** 打开安装确认弹窗的更新态；只在市场轴可更新时提供入口。 */
+  onUpdateFromMarket: (
+    installation: EndpointInstallation,
+    currentDefinition: EndpointDefinition,
+    hasUnsavedChanges: boolean,
+  ) => void;
+  /** 更新弹窗所需的条目详情正在加载。 */
+  marketUpdatePending: boolean;
+  /** 为当前这个 ComfyUI 端点重新导入一份 workflow：新 workflow 接到传出去的这份定义上，回来走重匹配。 */
+  onReimportComfyui: (current: ComfyuiEndpointDefinition) => void;
+}
+
+/** 安装记录的来源描述：来源被删除时只剩规范键原文，禁用或删除都注明。 */
+function MarketOrigin({ installation }: { installation: EndpointInstallation }) {
+  const { t } = useTranslation("dashboard");
+  const source = installation.source_display_name ?? installation.source_key;
+  const key =
+    installation.source_enabled === null
+      ? "ce_from_market_source_deleted"
+      : installation.source_enabled
+        ? "ce_from_market"
+        : "ce_from_market_source_disabled";
+  return <span className="min-w-0 break-all">{t(key, { source })}</span>;
+}
+
+function KindBadge({ selection }: { selection: EndpointSelection }) {
+  const { t } = useTranslation("dashboard");
+  const custom = selection.mode === "new" || savedRecordOf(selection) !== null;
+  const label =
+    selection.mode === "python"
+      ? t("ce_group_builtin_python")
+      : custom
+        ? t("ce_kind_custom")
+        : t("ce_group_builtin");
+  return (
+    <span
+      className={`shrink-0 rounded-[5px] border px-1.5 py-0.5 font-mono text-[9.5px] font-bold uppercase tracking-[0.1em] ${
+        custom ? "border-accent/35 bg-accent-dim text-accent-2" : "border-hairline-soft bg-bg-grad-a/55 text-text-3"
+      }`}
+    >
+      {label}
+    </span>
+  );
+}
+
+export function EndpointDetail({
+  selection,
+  providers,
+  referenceCount,
+  onSaved,
+  onDeleted,
+  onCopied,
+  onCreateProvider,
+  onNavigateToModel,
+  onUpdateFromMarket,
+  marketUpdatePending,
+  onReimportComfyui,
+}: EndpointDetailProps) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  const pushToast = useAppStore((s) => s.pushToast);
+
+  const editable = selection.mode === "new" || selection.mode === "custom";
+  // 市场更新弹窗按点击时的草稿判断是否提示覆盖，条目详情加载期间不再接受编辑。
+  const readOnly = !editable || marketUpdatePending;
+  const savedRecord = savedRecordOf(selection);
+  const persistedId = savedRecord?.id ?? null;
+  const installation = savedRecord?.installation ?? null;
+
+  // 选中项由父级以 key 区分挂载，草稿因此可以直接由初始 selection 派生；
+  // 只有内置声明式端点的定义需要另行拉取。
+  const [draft, setDraft] = useState<EndpointDefinition | null>(() =>
+    selection.mode === "new" || selection.mode === "custom" ? selection.definition : null,
+  );
+  const [editorMode, setEditorMode] = useState<"form" | "json">("form");
+  // JSON 片段编辑器自持文本状态：换端点或从 JSON 视图返回时递增，强制它按新定义重挂载。
+  const [formEpoch, setFormEpoch] = useState(0);
+  const [jsonText, setJsonText] = useState("");
+  // parse：JSON 语法不通过；shape：语法通过但缺表单/头部直接解引用的容器结构。
+  // 两种情况都不写回草稿，文本保留供继续编辑。
+  const [jsonIssue, setJsonIssue] = useState<"parse" | "shape" | null>(null);
+  const [validation, setValidation] = useState<EndpointValidateResponse | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteReferences, setDeleteReferences] = useState<EndpointReference[] | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
+  const builtinKey = selection.mode === "builtin" ? selection.descriptor.key : null;
+
+  useEffect(() => {
+    if (builtinKey === null) return;
+    const controller = new AbortController();
+    voidCall(
+      API.getBuiltinEndpointDefinition(builtinKey)
+        .then((definition) => {
+          if (!controller.signal.aborted) setDraft(definition);
+        })
+        .catch((e) => {
+          if (!controller.signal.aborted) setLoadError(errMsg(e));
+        }),
+    );
+    return () => controller.abort();
+  }, [builtinKey]);
+
+  const draftJson = useMemo(() => (draft ? JSON.stringify(draft) : null), [draft]);
+
+  // 诊断卡与保存共用服务端校验器，编辑期持续复核。
+  useEffect(() => {
+    if (!editable || draftJson === null) return;
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      voidCall(
+        API.validateCustomEndpoint(JSON.parse(draftJson), {
+          excludeId: persistedId ?? undefined,
+          signal: controller.signal,
+        })
+          .then((result) => {
+            if (!controller.signal.aborted) setValidation(result);
+          })
+          .catch(() => {
+            // 校验请求本身失败时保留上一轮结果，不把网络问题呈现成定义错误。
+          }),
+      );
+    }, VALIDATE_DEBOUNCE_MS);
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [draftJson, editable, persistedId]);
+
+  const dirty =
+    selection.mode === "new" ||
+    (selection.mode === "custom" && draftJson !== JSON.stringify(selection.definition));
+
+  const hasErrors = (validation?.errors.length ?? 0) > 0;
+
+  const enterJsonMode = () => {
+    setJsonText(JSON.stringify(draft ?? {}, null, 2));
+    setJsonIssue(null);
+    setEditorMode("json");
+  };
+
+  const leaveJsonMode = () => {
+    setFormEpoch((n) => n + 1);
+    setEditorMode("form");
+  };
+
+  const handleSave = useCallback(async () => {
+    if (!draft) return;
+    setSaving(true);
+    try {
+      const saved =
+        persistedId === null
+          ? await API.createCustomEndpoint(draft)
+          : await API.updateCustomEndpoint(persistedId, draft);
+      pushToast(t("ce_saved"), "success");
+      onSaved(saved);
+    } catch (e) {
+      pushToast(errMsg(e, t("ce_save_failed")), "error");
+    } finally {
+      setSaving(false);
+    }
+  }, [draft, persistedId, onSaved, pushToast, t]);
+
+  const handleDelete = useCallback(async () => {
+    if (persistedId === null) return;
+    setDeleting(true);
+    try {
+      await API.deleteCustomEndpoint(persistedId);
+      setConfirmDelete(false);
+      pushToast(t("ce_deleted"), "success");
+      onDeleted();
+    } catch (e) {
+      const references = endpointReferences(e);
+      if (references) {
+        setDeleteReferences(references);
+        return;
+      }
+      pushToast(errMsg(e, t("ce_delete_failed")), "error");
+    } finally {
+      setDeleting(false);
+    }
+  }, [persistedId, onDeleted, pushToast, t]);
+
+  // 导出的是「当前看到的这份定义」：端点定义不含凭证，导出即备份与分享的那一步。
+  // ComfyUI 端点的导出在它自己的详情里，导的是带着当前节点绑定的那份草稿。
+  const exportable: AnyEndpointDefinition | null = draft;
+
+  const handleExport = useCallback(() => {
+    if (exportable) exportEndpointDefinition(exportable, installation?.slug);
+  }, [exportable, installation]);
+
+  const handleCopyAsMine = useCallback(async () => {
+    if (!draft) return;
+    setSaving(true);
+    try {
+      const created = await API.createCustomEndpoint(draft);
+      pushToast(t("ce_copied"), "success");
+      onCopied(created);
+    } catch (e) {
+      pushToast(errMsg(e, t("ce_copy_failed")), "error");
+    } finally {
+      setSaving(false);
+    }
+  }, [draft, onCopied, pushToast, t]);
+
+  /**
+   * 定位到诊断所指的分节；`enum_maps`、`defaults` 这类表单没有控件的字段落在
+   * JSON 视图。已在目标视图时不重挂载表单——重挂载会重置正在编辑的 JSON 片段。
+   */
+  const locateSection = (section: EndpointFormSection | null) => {
+    if (section === null) {
+      if (editorMode !== "json") enterJsonMode();
+      return;
+    }
+    if (editorMode === "json") leaveJsonMode();
+    requestAnimationFrame(() => {
+      document.getElementById(`ce-section-${section}`)?.scrollIntoView({ block: "start" });
+    });
+  };
+
+  const title =
+    selection.mode === "new"
+      ? t("ce_new_endpoint")
+      : savedRecord
+        ? savedRecord.display_name || t("ce_unnamed")
+        : selection.mode === "builtin" || selection.mode === "python"
+          ? (selection.descriptor.display_name ?? t(selection.descriptor.display_name_key))
+          : t("ce_unnamed");
+
+  const endpointKey = savedRecord
+    ? savedRecord.key
+    : selection.mode === "builtin" || selection.mode === "python"
+      ? selection.descriptor.key
+      : null;
+
+  // Python 内置端点没有可展示的定义：它由代码实现，只列接口信息。
+  const definitionless = selection.mode === "python";
+
+  const exportButton = exportable !== null && (
+    <button type="button" onClick={handleExport} className={GHOST_BTN_CLS}>
+      <Download className="h-3.5 w-3.5" aria-hidden />
+      {t("ce_export")}
+    </button>
+  );
+
+  const deleteButton = persistedId !== null && (
+    <button
+      type="button"
+      onClick={() => {
+        setDeleteReferences(null);
+        setConfirmDelete(true);
+      }}
+      className={GHOST_BTN_CLS}
+    >
+      <Trash2 className="h-3.5 w-3.5" aria-hidden />
+      {t("common:delete")}
+    </button>
+  );
+
+  const confirmDeleteDialog = (
+    <ConfirmDialog
+      open={confirmDelete}
+      title={t("ce_delete_title")}
+      description={
+        deleteReferences ? (
+          <EndpointReferenceList references={deleteReferences} onNavigateToModel={onNavigateToModel} />
+        ) : (
+          t("ce_delete_desc", { name: title })
+        )
+      }
+      confirmLabel={t("common:delete")}
+      tone="danger"
+      loading={deleting}
+      onConfirm={() => void handleDelete()}
+      onCancel={() => {
+        setConfirmDelete(false);
+        setDeleteReferences(null);
+      }}
+    />
+  );
+
+  // ComfyUI 端点的定义是 workflow 加节点绑定，没有声明式表单的 submit / poll 两节，
+  // 详情与绑定编辑器另有其形；删除入口仍由本组件提供，两种 kind 共用同一条生命周期。
+  if (selection.mode === "comfyui" || selection.mode === "comfyui-draft") {
+    const draftRecord = selection.mode === "comfyui" ? selection.record : selection.draft.record;
+    // 端点测试的凭证来源只列 comfyui 协议的供应商：别的协议的地址与密钥打不到一台 ComfyUI 上。
+    const comfyuiProviders = providers.filter((provider) => provider.discovery_format === "comfyui");
+    return (
+      <>
+        <ComfyuiEndpointDetail
+          record={draftRecord}
+          definition={selection.mode === "comfyui" ? selection.definition : selection.draft.definition}
+          sourceFileName={selection.mode === "comfyui" ? null : selection.draft.fileName}
+          initialInference={selection.mode === "comfyui" ? null : selection.draft.inference}
+          referenceCount={referenceCount}
+          providers={comfyuiProviders}
+          onSaved={onSaved}
+          onReimport={onReimportComfyui}
+          deleteButton={deleteButton}
+        />
+        {confirmDeleteDialog}
+      </>
+    );
+  }
+
+  return (
+    <div className="px-6 py-6">
+      {/* 头部 */}
+      <div className="mb-5 flex flex-wrap items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h2 className="font-editorial text-[20px] text-text">{title}</h2>
+            <KindBadge selection={selection} />
+            {installation && <MarketInstallBadges state={installation.state} modified={installation.modified} />}
+          </div>
+          <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[12px] text-text-3">
+            {draft && (
+              <span className="whitespace-nowrap">
+                {draft.meta.author} · v{draft.meta.version}
+              </span>
+            )}
+            {installation && <MarketOrigin installation={installation} />}
+            {referenceCount > 0 && <span>{t("ce_reference_count", { n: referenceCount })}</span>}
+          </div>
+        </div>
+
+        {draft && endpointKey && (
+          <button
+            type="button"
+            onClick={() => onCreateProvider(draft, endpointKey)}
+            title={t("ce_create_provider_hint")}
+            className={GHOST_BTN_CLS}
+          >
+            <Plus className="h-3.5 w-3.5" aria-hidden />
+            {t("ce_create_provider")}
+          </button>
+        )}
+
+        {installation?.state === "update_available" && (
+          <button
+            type="button"
+            onClick={() => draft && onUpdateFromMarket(installation, draft, dirty || jsonIssue !== null)}
+            disabled={marketUpdatePending || !draft}
+            className={GHOST_BTN_CLS}
+          >
+            {marketUpdatePending ? (
+              <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin" aria-hidden />
+            ) : (
+              <RefreshCw className="h-3.5 w-3.5" aria-hidden />
+            )}
+            {t("market_update")}
+          </button>
+        )}
+
+        {editable ? (
+          <>
+            {exportButton}
+            <a href={MARKET_CONTRIBUTING_URL} target="_blank" rel="noreferrer" className={GHOST_BTN_CLS}>
+              {t("ce_contribute_to_market")}
+              <ExternalLink className="h-3 w-3" aria-hidden />
+            </a>
+            {deleteButton}
+            <button
+              type="button"
+              onClick={() => void handleSave()}
+              disabled={saving || marketUpdatePending || hasErrors || jsonIssue !== null || !dirty}
+              title={hasErrors ? t("ce_save_blocked") : undefined}
+              className={ACCENT_BTN_SM_CLS}
+              style={ACCENT_BUTTON_STYLE}
+            >
+              {saving && <Loader2 className="h-3 w-3 motion-safe:animate-spin" aria-hidden />}
+              {t("ce_save")}
+            </button>
+          </>
+        ) : selection.mode === "builtin" ? (
+          <button
+            type="button"
+            onClick={() => void handleCopyAsMine()}
+            disabled={saving || !draft}
+            className={GHOST_BTN_CLS}
+          >
+            <Copy className="h-3.5 w-3.5" aria-hidden />
+            {t("ce_copy_as_mine")}
+          </button>
+        ) : (
+          <>
+            {exportButton}
+            {deleteButton}
+          </>
+        )}
+      </div>
+
+      {!editable && (
+        <div className="mb-5 rounded-[10px] border border-hairline bg-bg-grad-a/40 px-4 py-3 text-[12.5px] leading-[1.55] text-text-2">
+          {selection.mode === "builtin" ? t("ce_builtin_readonly") : t("ce_python_readonly")}
+        </div>
+      )}
+
+      {selection.mode === "python" && (
+        <div className="rounded-[10px] border border-hairline p-4 font-mono text-[12px] text-text-2" style={CARD_STYLE}>
+          {selection.descriptor.request_method}{" "}
+          <span className="text-good/85">{selection.descriptor.request_path_template}</span>
+        </div>
+      )}
+
+      {loadError && (
+        <p role="alert" className="text-[12.5px] text-warm-bright">
+          {loadError}
+        </p>
+      )}
+
+      {!definitionless && !draft && !loadError && (
+        <div className="flex items-center gap-2 py-8 text-text-3">
+          <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin text-accent-2" aria-hidden />
+          <span className="font-mono text-[11px] uppercase tracking-[0.14em]">
+            {t("common:loading")}
+          </span>
+        </div>
+      )}
+
+      {draft && !definitionless && (
+        <>
+          {editable && validation && (
+            <EndpointDiagnostics
+              errors={validation.errors}
+              warnings={validation.warnings}
+              onLocate={locateSection}
+            />
+          )}
+
+          <div className="mb-4 inline-flex rounded-[8px] border border-hairline bg-bg-grad-a/40 p-0.5">
+            {(["form", "json"] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => {
+                  if (mode === editorMode) return;
+                  if (mode === "json") enterJsonMode();
+                  else leaveJsonMode();
+                }}
+                aria-pressed={editorMode === mode}
+                className={`rounded-[6px] px-3 py-1 text-[12px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+                  editorMode === mode ? "bg-accent-dim text-accent-2" : "text-text-3 hover:text-text"
+                }`}
+              >
+                {mode === "form" ? t("ce_view_form") : t("ce_view_json")}
+              </button>
+            ))}
+          </div>
+
+          {editorMode === "json" ? (
+            <div>
+              <textarea
+                value={jsonText}
+                readOnly={readOnly}
+                spellCheck={false}
+                aria-label={t("ce_view_json")}
+                aria-invalid={jsonIssue !== null || undefined}
+                rows={28}
+                onChange={(e) => {
+                  setJsonText(e.target.value);
+                  let parsed: unknown;
+                  try {
+                    parsed = JSON.parse(e.target.value);
+                  } catch {
+                    setJsonIssue("parse");
+                    return;
+                  }
+                  if (!isRenderableDefinition(parsed)) {
+                    setJsonIssue("shape");
+                    return;
+                  }
+                  setDraft(parsed);
+                  setJsonIssue(null);
+                }}
+                className={`${INPUT_CLS} resize-y font-mono text-[11.5px] leading-[1.65] read-only:border-accent/25 read-only:bg-bg-grad-b/65 read-only:text-text-2`}
+              />
+              {jsonIssue !== null && (
+                <span role="alert" className="mt-1.5 block text-[12px] text-warm-bright">
+                  {t(jsonIssue === "parse" ? "ce_json_parse_error" : "ce_json_shape_error")}
+                </span>
+              )}
+            </div>
+          ) : (
+            <VariableInsertionProvider key={formEpoch}>
+              <EndpointForm definition={draft} onChange={setDraft} readOnly={readOnly} />
+              <EndpointTestSection definition={draft} providers={providers} />
+            </VariableInsertionProvider>
+          )}
+        </>
+      )}
+
+      {confirmDeleteDialog}
+    </div>
+  );
+}

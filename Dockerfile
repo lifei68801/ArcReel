@@ -5,10 +5,13 @@ FROM node:22-slim AS frontend-builder
 
 WORKDIR /build/frontend
 
-# 安装 pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# 启用 corepack；pnpm 版本由 frontend/package.json 的 packageManager 字段固定
+# 关闭交互式下载确认，否则 docker build 这种非 TTY 环境会卡在
+# "Corepack is about to download ..." 直到超时
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN corepack enable
 
-# 先复制依赖文件，利用缓存
+# 先复制依赖文件，利用缓存（corepack 按 packageManager 字段自动下载对应 pnpm）
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
@@ -25,7 +28,14 @@ FROM python:3.12-slim AS production
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
+    bubblewrap \
+    socat \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# 升级基础镜像预装的 pip：依赖全部由 uv 安装、运行时不调用 pip，
+# 但 python:3.12-slim 自带的旧 pip 会被镜像扫描器报 CVE，升级以清除这些告警
+RUN python -m pip install --no-cache-dir --upgrade pip
 
 # 安装 uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
@@ -34,6 +44,9 @@ WORKDIR /app
 
 # 禁用 Python 输出缓冲，确保日志实时输出到 Docker logs
 ENV PYTHONUNBUFFERED=1
+
+# 默认时区，可由 docker-compose / 运行时 -e TZ=... 覆盖
+ENV TZ=Asia/Shanghai
 
 # 先复制依赖和包元数据文件，利用缓存
 COPY pyproject.toml uv.lock README.md ./

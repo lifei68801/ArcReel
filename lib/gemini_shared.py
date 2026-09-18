@@ -6,23 +6,31 @@ providers / media_generator 等模块复用，避免循环依赖。
 
 包含：
 - VERTEX_SCOPES — Vertex AI OAuth scopes
-- RETRYABLE_ERRORS — 可重试错误类型
+- RETRYABLE_ERRORS — Gemini 专用可重试错误类型（扩展自 BASE_RETRYABLE_ERRORS）
 - RateLimiter — 多模型滑动窗口限流器
 - _rate_limiter_limits_from_env / get_shared_rate_limiter / refresh_shared_rate_limiter
-- with_retry / with_retry_async — 带指数退避的重试装饰器
+- with_retry_async — 从 lib.retry re-export 的通用重试装饰器
 """
 
 import asyncio
-import functools
 import logging
-import random
 import threading
 import time
 from collections import deque
-from pathlib import Path
 from typing import Optional
 
 from .cost_calculator import cost_calculator
+from .retry import BASE_RETRYABLE_ERRORS, with_retry_async
+
+__all__ = [
+    "BASE_RETRYABLE_ERRORS",
+    "RETRYABLE_ERRORS",
+    "VERTEX_SCOPES",
+    "RateLimiter",
+    "get_shared_rate_limiter",
+    "refresh_shared_rate_limiter",
+    "with_retry_async",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -32,27 +40,34 @@ VERTEX_SCOPES = [
     "https://www.googleapis.com/auth/generative-language",
 ]
 
-# 可重试的错误类型
-RETRYABLE_ERRORS: tuple[type[Exception], ...] = (
-    ConnectionError,
-    TimeoutError,
-)
+# Gemini 专用可重试错误类型（扩展基础集合）
+RETRYABLE_ERRORS: tuple[type[Exception], ...] = BASE_RETRYABLE_ERRORS
 
-# 尝试导入 Google API 错误类型
+# 尝试导入 Google API 错误类型；google.api_core 与 google.genai 各自独立 try，
+# 避免一边缺包就把另一边的可重试错误一起丢掉
 try:
-    from google import genai  # Import genai to access its errors
-    from google.api_core import exceptions as google_exceptions
+    from google.api_core import exceptions as google_exceptions  # pyright: ignore[reportMissingImports]
 
-    RETRYABLE_ERRORS = RETRYABLE_ERRORS + (
+    RETRYABLE_ERRORS = (
+        *RETRYABLE_ERRORS,
         google_exceptions.ResourceExhausted,  # 429 Too Many Requests
         google_exceptions.ServiceUnavailable,  # 503
         google_exceptions.DeadlineExceeded,  # 超时
         google_exceptions.InternalServerError,  # 500
-        genai.errors.ClientError,  # 4xx errors from new SDK
-        genai.errors.ServerError,  # 5xx errors from new SDK
     )
 except ImportError:
-    pass
+    logger.debug("google.api_core 未安装，跳过对应可重试错误，沿用基础集合")
+
+try:
+    from google import genai
+
+    RETRYABLE_ERRORS = (
+        *RETRYABLE_ERRORS,
+        genai.errors.ClientError,
+        genai.errors.ServerError,
+    )
+except ImportError:
+    logger.debug("google.genai 未安装，跳过对应可重试错误，沿用基础集合")
 
 
 class RateLimiter:
@@ -60,7 +75,7 @@ class RateLimiter:
     多模型滑动窗口限流器
     """
 
-    def __init__(self, limits_dict: dict[str, int] = None, *, request_gap: float = 3.1):
+    def __init__(self, limits_dict: dict[str, int] | None = None, *, request_gap: float = 3.1):
         """
         Args:
             limits_dict: {model_name: rpm} 字典。例如 {"gemini-3-pro-image-preview": 20}
@@ -171,6 +186,13 @@ class RateLimiter:
 _SHARED_IMAGE_MODEL_NAME = cost_calculator.DEFAULT_IMAGE_MODEL
 _SHARED_VIDEO_MODEL_NAME = cost_calculator.DEFAULT_VIDEO_MODEL
 
+
+def resolve_gemini_api_key(api_key: str | None = None) -> str:
+    if api_key is None or not api_key.strip():
+        raise ValueError("请到系统配置页填写 Gemini API Key")
+    return api_key.strip()
+
+
 _shared_rate_limiter: Optional["RateLimiter"] = None
 _shared_rate_limiter_lock = threading.Lock()
 
@@ -216,9 +238,6 @@ def get_shared_rate_limiter(
     - request_gap：最小请求间隔（None 时从环境变量 GEMINI_REQUEST_GAP 读取，默认 3.1）
     """
     global _shared_rate_limiter
-    if _shared_rate_limiter is not None:
-        return _shared_rate_limiter
-
     with _shared_rate_limiter_lock:
         if _shared_rate_limiter is not None:
             return _shared_rate_limiter
@@ -262,146 +281,3 @@ def refresh_shared_rate_limiter(
             limiter.request_gap = request_gap
 
     return limiter
-
-
-def with_retry(
-    max_attempts: int = 5,
-    backoff_seconds: tuple[int, ...] = (2, 4, 8, 16, 32),
-    retryable_errors: tuple[type[Exception], ...] = RETRYABLE_ERRORS,
-):
-    """
-    带指数退避的重试装饰器
-    """
-
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            # 尝试提取 output_path 以便在日志中显示上下文
-            output_path = kwargs.get("output_path")
-            # 如果是位置参数，generate_image 的 output_path 是第 5 个参数 (self, prompt, ref, ar, output_path)
-            if not output_path and len(args) > 4:
-                output_path = args[4]
-
-            context_str = ""
-            if output_path:
-                context_str = f"[{Path(output_path).name}] "
-
-            last_error = None
-            for attempt in range(max_attempts):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    # Catch ALL exceptions and check if they look like a retryable error
-                    last_error = e
-                    should_retry = False
-
-                    # Check if it's in our explicit list
-                    if isinstance(e, retryable_errors):
-                        should_retry = True
-
-                    # Check by string analysis (catch-all for 429/500/503)
-                    error_str = str(e)
-                    if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                        should_retry = True
-                    elif "500" in error_str or "InternalServerError" in error_str:
-                        should_retry = True
-                    elif "503" in error_str or "ServiceUnavailable" in error_str:
-                        should_retry = True
-
-                    if not should_retry:
-                        raise e
-
-                    if attempt < max_attempts - 1:
-                        # 确保不超过 backoff 数组长度
-                        backoff_idx = min(attempt, len(backoff_seconds) - 1)
-                        base_wait = backoff_seconds[backoff_idx]
-                        jitter = random.uniform(0, 2)  # 0-2秒随机抖动
-                        wait_time = base_wait + jitter
-                        logger.warning(
-                            "%sAPI 调用异常: %s - %s",
-                            context_str,
-                            type(e).__name__,
-                            str(e)[:200],
-                        )
-                        logger.warning(
-                            "%s重试 %d/%d, %.1f 秒后...",
-                            context_str,
-                            attempt + 1,
-                            max_attempts - 1,
-                            wait_time,
-                        )
-                        time.sleep(wait_time)
-            raise last_error
-
-        return wrapper
-
-    return decorator
-
-
-def with_retry_async(
-    max_attempts: int = 5,
-    backoff_seconds: tuple[int, ...] = (2, 4, 8, 16, 32),
-    retryable_errors: tuple[type[Exception], ...] = RETRYABLE_ERRORS,
-):
-    """
-    异步函数重试装饰器，带指数退避和随机抖动
-    """
-
-    def decorator(func):
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            # 尝试提取 output_path 以便在日志中显示上下文
-            output_path = kwargs.get("output_path")
-            if not output_path and len(args) > 4:
-                output_path = args[4]
-
-            context_str = ""
-            if output_path:
-                context_str = f"[{Path(output_path).name}] "
-
-            last_error = None
-            for attempt in range(max_attempts):
-                try:
-                    return await func(*args, **kwargs)
-                except Exception as e:
-                    last_error = e
-                    should_retry = False
-
-                    if isinstance(e, retryable_errors):
-                        should_retry = True
-
-                    error_str = str(e)
-                    if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                        should_retry = True
-                    elif "500" in error_str or "InternalServerError" in error_str:
-                        should_retry = True
-                    elif "503" in error_str or "ServiceUnavailable" in error_str:
-                        should_retry = True
-
-                    if not should_retry:
-                        raise e
-
-                    if attempt < max_attempts - 1:
-                        backoff_idx = min(attempt, len(backoff_seconds) - 1)
-                        base_wait = backoff_seconds[backoff_idx]
-                        jitter = random.uniform(0, 2)  # 0-2秒随机抖动
-                        wait_time = base_wait + jitter
-                        logger.warning(
-                            "%sAPI 调用异常: %s - %s",
-                            context_str,
-                            type(e).__name__,
-                            str(e)[:200],
-                        )
-                        logger.warning(
-                            "%s重试 %d/%d, %.1f 秒后...",
-                            context_str,
-                            attempt + 1,
-                            max_attempts - 1,
-                            wait_time,
-                        )
-                        await asyncio.sleep(wait_time)
-            raise last_error
-
-        return wrapper
-
-    return decorator

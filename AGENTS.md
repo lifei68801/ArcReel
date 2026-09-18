@@ -1,166 +1,33 @@
-# AGENTS.md
+# ArcReel
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+AI 视频创作平台，将小说、剧本或创作构想转化为短视频。三层结构：`frontend/`（React SPA）→ `server/`（FastAPI，`agent_runtime/` 封装 Claude Agent SDK）→ `lib/`（核心库）。内嵌创作 Agent 的配置源在 `agent_runtime_profile/`，与开发态 `.claude/` 分离。
 
-## 语言规范
-- **回答用户必须使用中文**：所有回复、思考过程、任务清单及计划文件，均须使用中文
+## 工具链与校验
 
-## 项目概述
-
-ArcReel 是一个 AI 视频生成平台，将小说转化为短视频。三层架构：
-
-```
-frontend/ (React SPA)  →  server/ (FastAPI)  →  lib/ (核心库)
-  React 19 + Tailwind       路由分发 + SSE        Gemini API
-  wouter 路由               agent_runtime/        GenerationQueue
-  zustand 状态管理          (Claude Agent SDK)     ProjectManager
-```
-
-## 开发命令
+后端使用 `uv`，前端与文档站使用 `pnpm`。修改代码或测试时，先按 `CONTRIBUTING.md`「测试选择」运行相关测试；任务完成和 push 前执行受影响域的全量闸门：
 
 ```bash
-# 后端
-uv run python -m pytest                              # 测试（-v 单文件 / -k 关键字 / --cov 覆盖率）
-uv run ruff check . && uv run ruff format .          # lint + format
-uv sync                                              # 安装依赖
-uv run alembic upgrade head                          # 数据库迁移
-uv run alembic revision --autogenerate -m "desc"     # 生成迁移
-
-# 前端（cd frontend &&）
-pnpm build       # 生产构建 (含 typecheck)
-pnpm check       # typecheck + test
+uv run ruff check . && uv run ruff format . && uv run basedpyright --warnings && uv run lint-imports && uv run deptry lib server alembic scripts tests && uv run python -m pytest -n 4 --dist loadfile
+uv run python scripts/audit_tests.py --check   # 改动测试文件时；同时扫后端 tests/ 与前端 *.test.*
+uv run pre-commit run --all-files actionlint && uv run pre-commit run --all-files zizmor   # 改动 .github/ 时
+(cd frontend && pnpm check)
+(cd website && pnpm check)
 ```
 
-## 架构要点
+相关测试必须实际运行且通过；若选择结果为 0 个测试，须扩大范围。启动开发服务器、数据库迁移、测试选择与规范（分层/替身/判据/闸门）、分支与提交规范、依赖管理、注释规范、静态工具的豁免规范见 `CONTRIBUTING.md`。
 
-### 后端 API 路由
+## 通用规范
 
-所有 API 在 `/api/v1` 下，路由定义在 `server/routers/`：
-- `projects.py` — 项目 CRUD、概述生成
-- `generate.py` — 分镜/视频/角色/线索生成（入队到任务队列）
-- `assistant.py` — Claude Agent SDK 会话管理（SSE 流式）
-- `agent_chat.py` — 智能体对话交互
-- `tasks.py` — 任务队列状态（SSE 流式）
-- `project_events.py` — 项目事件 SSE 推送
-- `files.py` — 文件上传与静态资源
-- `versions.py` — 资源版本历史与回滚
-- `characters.py` / `clues.py` — 角色/线索管理
-- `usage.py` — API 用量统计
-- `auth.py` / `api_keys.py` — 认证与 API 密钥管理
-- `system_config.py` — 系统配置
-- `providers.py` — 预置供应商配置管理（列表、读写、连接测试）
-- `custom_providers.py` — 自定义供应商 CRUD、模型管理与发现、连接测试
+- 面向用户的文本须同步添加全部已支持语言的翻译 key（语言清单以 `frontend/src/i18n/` 为准，由 `tests/unit/lib/i18n/test_i18n_consistency.py` 校验）。例外：卡片与区块顶部的 mono kicker（`SectionCard` / `ChannelCard` / `SectionShell` / `PlaceholderTile` 的 `kicker` 及同款 eyebrow 标签）是 Darkroom 设计语言的一部分，固定英文直接写在组件里，不进 i18n。
+- 代码与测试注释仅描述当前行为与约束；变更原因与议题编号写在 commit message / PR 描述中。
 
-### server/services/ — 业务服务层
+## 架构
 
-- `generation_tasks.py` — 分镜/视频/角色/线索生成任务编排
-- `project_archive.py` — 项目导出（ZIP 打包）
-- `project_events.py` — 项目变更事件发布
-- `jianying_draft_service.py` — 剪映草稿导出
+架构总览、扩展新供应商、扩展新工作流阶段：`website/docs/dev/architecture.md`。
 
-### lib/ 核心模块
+## Agent skills
 
-- **{gemini,ark,grok,openai}_shared** — 各供应商 SDK 工厂与共享工具
-- **image_backends/** / **video_backends/** / **text_backends/** — 多供应商媒体生成后端，Registry + Factory 模式（gemini/ark/grok/openai）
-- **custom_provider/** — 自定义供应商支持：后端包装、模型发现、工厂创建（OpenAI/Google 兼容）
-- **MediaGenerator** (`media_generator.py`) — 组合后端 + VersionManager + UsageTracker
-- **GenerationQueue** (`generation_queue.py`) — 异步任务队列，SQLAlchemy ORM 后端，lease-based 并发控制
-- **GenerationWorker** (`generation_worker.py`) — 后台 Worker，分 image/video 两条并发通道
-- **ProjectManager** (`project_manager.py`) — 项目文件系统操作和数据管理
-- **StatusCalculator** (`status_calculator.py`) — 读时计算状态字段，不存储冗余状态
-- **UsageTracker** (`usage_tracker.py`) — API 用量追踪
-- **CostCalculator** (`cost_calculator.py`) — 费用计算
-- **TextGenerator** (`text_generator.py`) — 文本生成任务
-
-### lib/config/ — 供应商配置系统
-
-ConfigService（`service.py`）→ Repository（持久化 + 密钥脱敏）→ Resolver（解析）。`registry.py` 维护预置供应商注册表（PROVIDER_REGISTRY）。
-
-### lib/db/ — SQLAlchemy Async ORM 层
-
-- `engine.py` — 异步引擎 + session factory（`DATABASE_URL` 默认 `sqlite+aiosqlite`）
-- `models/` — ORM 模型：Task / ApiCall / ApiKey / AgentSession / Config / Credential / User / CustomProvider / CustomProviderModel
-- `repositories/` — 异步 Repository：Task / Usage / Session / ApiKey / Credential / CustomProvider
-
-数据库文件：`projects/.arcreel.db`（开发 SQLite）
-
-### Agent Runtime（Claude Agent SDK 集成）
-
-`server/agent_runtime/` 封装 Claude Agent SDK：
-- `AssistantService` (`service.py`) — 编排 Claude SDK 会话
-- `SessionManager` — 会话生命周期 + SSE 订阅者模式
-- `StreamProjector` — 从流式事件构建实时助手回复
-
-### 前端
-
-- React 19 + TypeScript + Tailwind CSS 4
-- 路由：`wouter`（非 React Router）
-- 状态管理：`zustand`（stores 在 `frontend/src/stores/`）
-- 路径别名：`@/` → `frontend/src/`
-- Vite 代理：`/api` → `http://127.0.0.1:1241`
-
-## 关键设计模式
-
-### 数据分层
-
-| 数据类型 | 存储位置 | 策略 |
-|---------|---------|------|
-| 角色/线索定义 | `project.json` | 单一真相源，剧本中仅引用名称 |
-| 剧集元数据（episode/title/script_file） | `project.json` | 剧本保存时写时同步 |
-| 统计字段（scenes_count / status / progress） | 不存储 | `StatusCalculator` 读时计算注入 |
-
-### 实时通信
-
-- 助手：`/api/v1/assistant/sessions/{id}/stream` — SSE 流式回复
-- 项目事件：`/api/v1/projects/{name}/events/stream` — SSE 推送项目变更
-- 任务队列：前端轮询 `/api/v1/tasks` 获取状态
-
-### 任务队列
-
-所有生成任务（分镜/视频/角色/线索）统一通过 GenerationQueue 入队，由 GenerationWorker 异步处理。
-`generation_queue_client.py` 的 `enqueue_and_wait()` 封装入队 + 等待完成。
-
-### Pydantic 数据模型
-
-`lib/script_models.py` 定义 `NarrationSegment` 和 `DramaScene`，用于剧本验证。
-`lib/data_validator.py` 验证 `project.json` 和剧集 JSON 的结构与引用完整性。
-
-## 智能体运行环境
-
-智能体专用配置（skills、agents、系统 prompt）位于 `agent_runtime_profile/` 目录，
-与开发态 `.claude/` 物理分离。
-
-### Skill 维护
-
-```bash
-# 触发率评估（需要 anthropic SDK：uv pip install anthropic）
-PYTHONPATH=~/.claude/plugins/cache/claude-plugins-official/skill-creator/*/skills/skill-creator:$PYTHONPATH \
-  uv run python -m scripts.run_eval \
-  --eval-set <eval-set.json> \
-  --skill-path agent_runtime_profile/.claude/skills/<skill-name> \
-  --model sonnet --runs-per-query 2 --verbose
-```
-
-#### Gotchas
-
-- **SKILL.md 与脚本同步**：修改 skill 脚本时需同步更新 SKILL.md，反之亦然，二者必须保持一致
-
-## 环境配置
-
-复制 `.env.example` 到 `.env`，设置认证参数（`AUTH_USERNAME`/`AUTH_PASSWORD`/`AUTH_TOKEN_SECRET`）。
-API Key、后端选择、模型配置等通过 WebUI 配置页（`/settings`）管理。
-外部工具依赖：`ffmpeg`（视频拼接与后期处理）。
-
-### 代码质量
-
-**ruff**（lint + format）：
-- 规则集：`E`/`F`/`I`/`UP`，忽略 `E402`（既有模式）和 `E501`（由 formatter 管理）
-- line-length：120
-- 排除 `.worktrees`、`.claude/worktrees` 目录
-- CI 中强制检查：`ruff check . && ruff format --check .`
-
-**pytest**：
-- `asyncio_mode = "auto"`（无需手动标记 async 测试）
-- 测试覆盖范围：`lib/` 和 `server/`，CI 要求 ≥80%
-- 共用 fixtures 在 `tests/conftest.py`，工厂在 `tests/factories.py`，fakes 在 `tests/fakes.py`
-- test 依赖在 `[dependency-groups] dev` 中，`uv sync` 默认安装，生产镜像通过 `--no-dev` 排除
+- 议题追踪：GitHub Issues，用 `gh` CLI 操作；Spec 与 ticket 的约定见 `docs/agents/issue-tracker.md`。
+- Triage 标签状态机：`docs/agents/triage-labels.md`。
+- 领域文档（`CONTEXT.md` + `docs/adr/`）的使用方式：`docs/agents/domain.md`。
+- 项目 schema 迁移：新增或修改 `lib/project_migrations/` 的迁移步、改动产物补录规划器时读 `docs/agents/project-migrations.md`。

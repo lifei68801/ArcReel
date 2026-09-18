@@ -1,21 +1,26 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { ChevronDown } from "lucide-react";
 import { AutoTextarea } from "@/components/ui/AutoTextarea";
 import { CompactInput } from "@/components/ui/CompactInput";
 import { DropdownPill } from "@/components/ui/DropdownPill";
-import { SHOT_TYPES } from "@/types";
+import { SHOT_TYPES, SHOT_TYPE_I18N_KEYS } from "@/types";
 import type { ImagePrompt, ShotType } from "@/types";
 
 interface ImagePromptEditorProps {
   prompt: ImagePrompt;
   onUpdate: (patch: Partial<ImagePrompt>) => void;
+  /** 只读展示（引导演示项目）：字段可读不可改。 */
+  readOnly?: boolean;
 }
 
 /** Structured editor for ImagePrompt fields with collapsible composition section. */
 export function ImagePromptEditor({
   prompt,
   onUpdate,
+  readOnly,
 }: ImagePromptEditorProps) {
+  const { t } = useTranslation("dashboard");
   const [collapsed, setCollapsed] = useState(false);
 
   return (
@@ -23,7 +28,8 @@ export function ImagePromptEditor({
       <AutoTextarea
         value={prompt.scene}
         onChange={(v) => onUpdate({ scene: v })}
-        placeholder="分镜图描述..."
+        readOnly={readOnly}
+        placeholder={t("image_prompt_placeholder")}
       />
 
       {/* Collapsible composition fields */}
@@ -35,15 +41,17 @@ export function ImagePromptEditor({
         <ChevronDown
           className={`h-3 w-3 transition-transform ${collapsed ? "-rotate-90" : ""}`}
         />
-        构图参数
+        {t("composition_params")}
       </button>
 
       {!collapsed && (
         <div className="flex flex-col gap-2 pl-1">
           <DropdownPill
-            label="镜头"
+            label={t("shot_label")}
             value={prompt.composition.shot_type}
             options={SHOT_TYPES}
+            renderOption={(v: ShotType) => t(SHOT_TYPE_I18N_KEYS[v])}
+            disabled={readOnly}
             onChange={(v: ShotType) =>
               onUpdate({
                 composition: { ...prompt.composition, shot_type: v },
@@ -51,24 +59,26 @@ export function ImagePromptEditor({
             }
           />
           <CompactInput
-            label="光线"
+            label={t("lighting_label")}
             value={prompt.composition.lighting}
             onChange={(v) =>
               onUpdate({
                 composition: { ...prompt.composition, lighting: v },
               })
             }
-            placeholder="光线描述..."
+            readOnly={readOnly}
+            placeholder={t("lighting_placeholder")}
           />
           <CompactInput
-            label="氛围"
+            label={t("ambiance_label")}
             value={prompt.composition.ambiance}
             onChange={(v) =>
               onUpdate({
                 composition: { ...prompt.composition, ambiance: v },
               })
             }
-            placeholder="氛围描述..."
+            readOnly={readOnly}
+            placeholder={t("ambiance_placeholder")}
           />
         </div>
       )}

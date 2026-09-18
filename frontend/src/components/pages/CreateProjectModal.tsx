@@ -1,251 +1,481 @@
-import { useState, useRef } from "react";
+
+import { useState, useEffect, useRef, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
+import { errMsg, voidCall, voidPromise } from "@/utils/async";
 import { useLocation } from "wouter";
-import { X, Loader2, Upload } from "lucide-react";
+import { Check, X } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { API } from "@/api";
 import { useProjectsStore } from "@/stores/projects-store";
 import { useAppStore } from "@/stores/app-store";
+import { DEFAULT_TEMPLATE_ID } from "@/data/style-templates";
+import { useFocusTrap } from "@/hooks/useFocusTrap";
+import { useEscapeClose } from "@/hooks/useEscapeClose";
+import { WizardStep1Basics, type WizardStep1Value } from "./create-project/WizardStep1Basics";
+import { WizardStep2Models, type WizardStep2Data } from "./create-project/WizardStep2Models";
+import { WizardStep3Style, type WizardStep3Value } from "./create-project/WizardStep3Style";
+import type { ModelConfigValue } from "@/components/shared/ModelConfigSection";
+import { catalogDisplayNames, catalogDurations } from "@/utils/provider-models";
+import { executingImageModel, executingVideoModel } from "@/components/shared/LayeredModelFields";
 
-const STYLE_OPTIONS = [
-  { value: "Photographic", label: "写实摄影" },
-  { value: "Anime", label: "动漫风格" },
-  { value: "3D Animation", label: "3D 动画" },
+// 新建项目对话框 · "Open Reel"
+// 仪式感来自项目大厅的 Darkroom 美学：editorial 衬线 + mono 标尺线 + sprocket 胶片孔。
+// 三步走作为录制流程的开机预备：身份 → 器材 → 镜头美学。
+
+const SPROCKET_STYLE: CSSProperties = {
+  background: "repeating-linear-gradient(90deg, oklch(0 0 0 / 0.55) 0 6px, transparent 6px 12px)",
+};
+
+// ─── Step indicator ───────────────────────────────────────────────────────────
+
+const STEPS = [
+  { num: 1, key: "wizard_step_basics" },
+  { num: 2, key: "wizard_step_models" },
+  { num: 3, key: "wizard_step_style" },
 ] as const;
 
+const STEP_BADGE_GRADIENT =
+  "linear-gradient(180deg, oklch(0.30 0.05 295 / 0.65), oklch(0.20 0.02 280 / 0.65))";
+
+const STEP_BADGE_ACTIVE_STYLE: CSSProperties = {
+  background: STEP_BADGE_GRADIENT,
+  boxShadow:
+    "inset 0 1px 0 oklch(1 0 0 / 0.06), 0 0 18px -6px var(--color-accent-glow)",
+};
+
+const STEP_BADGE_DONE_STYLE: CSSProperties = {
+  background: STEP_BADGE_GRADIENT,
+  boxShadow: "inset 0 1px 0 oklch(1 0 0 / 0.05)",
+};
+
+const STEP_BADGE_INACTIVE_STYLE: CSSProperties = {
+  background: "oklch(0.16 0.010 265 / 0.55)",
+};
+
+const STEP_CONNECTOR_DONE_STYLE: CSSProperties = {
+  height: 1,
+  background:
+    "linear-gradient(90deg, var(--color-accent), oklch(0.55 0.06 295 / 0.4))",
+};
+
+const STEP_CONNECTOR_INACTIVE_STYLE: CSSProperties = {
+  height: 1,
+  background: "var(--color-hairline-soft)",
+};
+
+function StepIndicator({ current }: { current: 1 | 2 | 3 }) {
+  const { t } = useTranslation("templates");
+  return (
+    <div className="relative">
+      {/* sprocket 上下边 — 暗示一段胶片正在过卷头 */}
+      <div aria-hidden className="absolute inset-x-6 top-0 h-[3px] opacity-40" style={SPROCKET_STYLE} />
+      <div aria-hidden className="absolute inset-x-6 bottom-0 h-[3px] opacity-40" style={SPROCKET_STYLE} />
+
+      <ol className="relative flex items-stretch py-5">
+        {STEPS.map((s, i) => {
+          const done = current > s.num;
+          const active = current === s.num;
+          const last = i === STEPS.length - 1;
+          return (
+            <li
+              key={s.num}
+              className={"relative flex flex-1 items-center" + (last ? "" : " pr-3")}
+              aria-current={active ? "step" : undefined}
+            >
+              <div className="flex items-center gap-2.5 min-w-0">
+                <span
+                  className={
+                    "grid h-7 w-7 shrink-0 place-items-center rounded-[8px] font-mono text-[11px] font-bold tabular-nums transition-colors " +
+                    (done
+                      ? "border border-accent/45 text-text"
+                      : active
+                        ? "border border-accent/55 text-text"
+                        : "border border-hairline-soft text-text-4")
+                  }
+                  style={
+                    active
+                      ? STEP_BADGE_ACTIVE_STYLE
+                      : done
+                        ? STEP_BADGE_DONE_STYLE
+                        : STEP_BADGE_INACTIVE_STYLE
+                  }
+                >
+                  {done ? <Check className="h-3.5 w-3.5" aria-hidden /> : s.num.toString().padStart(2, "0")}
+                </span>
+                <div className="min-w-0">
+                  <div
+                    className={
+                      "font-mono text-[9.5px] font-bold uppercase tracking-[0.14em] " +
+                      (active ? "text-accent-2" : done ? "text-text-3" : "text-text-4")
+                    }
+                  >
+                    Step {s.num.toString().padStart(2, "0")}
+                  </div>
+                  <div
+                    className={
+                      "text-[12.5px] tracking-tight truncate " +
+                      (active ? "text-text font-semibold" : done ? "text-text-2" : "text-text-3")
+                    }
+                  >
+                    {t(s.key)}
+                  </div>
+                </div>
+              </div>
+              {!last && (
+                <div
+                  aria-hidden
+                  className="ml-3 flex-1"
+                  style={done ? STEP_CONNECTOR_DONE_STYLE : STEP_CONNECTOR_INACTIVE_STYLE}
+                />
+              )}
+            </li>
+          );
+        })}
+      </ol>
+    </div>
+  );
+}
+
+// ─── Main component ───────────────────────────────────────────────────────────
+
 export function CreateProjectModal() {
+  const { t, i18n } = useTranslation(["dashboard", "common"]);
   const [, navigate] = useLocation();
-  const { setShowCreateModal, setCreatingProject, creatingProject } =
-    useProjectsStore();
+  const { setShowCreateModal } = useProjectsStore();
 
-  const [title, setTitle] = useState("");
-  const [contentMode, setContentMode] = useState<"narration" | "drama">("narration");
-  const [style, setStyle] = useState("Photographic");
-  const [titleError, setTitleError] = useState("");
-  const [styleImageFile, setStyleImageFile] = useState<File | null>(null);
-  const [styleImagePreview, setStyleImagePreview] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [step, setStep] = useState<1 | 2 | 3>(1);
 
-  const handleStyleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setStyleImageFile(file);
-    // 创建预览 URL
-    const url = URL.createObjectURL(file);
-    setStyleImagePreview(url);
+  const [basics, setBasics] = useState<WizardStep1Value>({
+    title: "",
+    contentMode: "narration",
+    sourceKind: "novel",
+    aspectRatio: "9:16",
+    generationRoute: null,
+    gridStoryboard: false,
+    targetDuration: 60,
+    speechRate: null,
+    episodeTargetDuration: null,
+  });
+
+  const [models, setModels] = useState<ModelConfigValue>({
+    videoBackend: "",
+    videoProviderI2V: "",
+    videoProviderR2V: "",
+    imageBackendDefault: "",
+    imageBackendT2I: "",
+    imageBackendI2I: "",
+    textBackendDefault: "",
+    textBackendSimple: "",
+    textBackendComplex: "",
+    defaultDuration: null,
+    videoResolution: null,
+    imageResolution: null,
+  });
+
+  const [style, setStyle] = useState<WizardStep3Value>({
+    mode: "template",
+    templateId: DEFAULT_TEMPLATE_ID,
+    activeCategory: "live",
+    uploadedFile: null,
+    uploadedPreview: null,
+  });
+
+  const [creating, setCreating] = useState(false);
+
+  // Step2 的远端数据 hoist 到此处：前进/后退切 step 时 Step2 unmount/mount 不再触发 HTTP，
+  // 只在 modal 挂载与界面语言变化时 fetch。供应商与模型名由后端按 Accept-Language 成文，
+  // 语言切换后须重取，否则目录停留在切换前的语言。
+  const [step2Data, setStep2Data] = useState<WizardStep2Data | null>(null);
+  const [step2Error, setStep2Error] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    voidCall((async () => {
+      try {
+        const [sysConfig, providersRes, customRes] = await Promise.all([
+          API.getSystemConfig(),
+          API.getProviders(),
+          API.listCustomProviders(),
+        ]);
+        if (cancelled) return;
+        const catalogNames = catalogDisplayNames(providersRes.providers, customRes.providers);
+        setStep2Data({
+          options: {
+            video: sysConfig.options.video_backends,
+            image: sysConfig.options.image_backends,
+            text: sysConfig.options.text_backends,
+            // 目录兜底层在下：候选只列 ready 供应商，而已配置的生效值可能指向失去凭证的那个。
+            providerNames: { ...catalogNames.providerNames, ...(sysConfig.options.provider_names ?? {}) },
+            modelNames: { ...catalogNames.modelNames, ...(sysConfig.options.model_names ?? {}) },
+          },
+          providers: providersRes.providers,
+          customProviders: customRes.providers,
+          globalDefaults: {
+            video: sysConfig.settings.default_video_backend ?? "",
+            videoI2V: sysConfig.settings.default_video_backend_i2v ?? "",
+            videoR2V: sysConfig.settings.default_video_backend_r2v ?? "",
+            image: sysConfig.settings.default_image_backend ?? "",
+            imageT2I: sysConfig.settings.default_image_backend_t2i ?? "",
+            imageI2I: sysConfig.settings.default_image_backend_i2i ?? "",
+            textDefault: sysConfig.settings.default_text_backend ?? "",
+            textSimple: sysConfig.settings.text_backend_simple ?? "",
+            textComplex: sysConfig.settings.text_backend_complex ?? "",
+          },
+        });
+        // 重取成功即清掉上一轮的错误，否则错误面板会一直遮住新数据。
+        setStep2Error(null);
+      } catch (err) {
+        if (!cancelled) setStep2Error(errMsg(err));
+      }
+    })());
+    return () => {
+      cancelled = true;
+    };
+  }, [i18n.language]);
+
+  // blob: URL 所有权集中在此：StylePicker 只通过 onChange 更换引用，
+  // revoke 统一由本 effect 在 URL 变更或 unmount 时触发。非 blob: 跳过。
+  useEffect(() => {
+    const url = style.uploadedPreview;
+    if (!url?.startsWith("blob:")) return;
+    return () => URL.revokeObjectURL(url);
+  }, [style.uploadedPreview]);
+
+  const handleClose = () => {
+    setShowCreateModal(false);
   };
 
-  const clearStyleImage = () => {
-    setStyleImageFile(null);
-    if (styleImagePreview) {
-      URL.revokeObjectURL(styleImagePreview);
-      setStyleImagePreview(null);
-    }
-    if (fileInputRef.current) fileInputRef.current.value = "";
+  useEscapeClose(() => setShowCreateModal(false));
+
+  // 背景 inert：打开期间屏蔽 #root 内容（modal 通过 portal 挂到 body，
+  // 不在 #root 子树内，因此不会被 inert 传染）。
+  useEffect(() => {
+    const root = document.getElementById("root");
+    if (!root) return;
+    root.setAttribute("aria-hidden", "true");
+    root.setAttribute("inert", "");
+    return () => {
+      root.removeAttribute("aria-hidden");
+      root.removeAttribute("inert");
+    };
+  }, []);
+
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(dialogRef, true);
+
+  // 第二步选好时长与分辨率后还能退回第一步改生成模式。分辨率只由执行模型决定，模型没换就不动；
+  // 时长按新执行模型的声明全集校验，落在全集外的退回自动。参考图路径把该值收窄掉的情形由
+  // 第二步按服务端成因的提示引导重选——收窄结果只有服务端能给，这里是同步事件处理器。
+  const handleBasicsChange = (next: WizardStep1Value) => {
+    setBasics(next);
+    if (next.generationRoute === basics.generationRoute) return;
+    const globals = step2Data?.globalDefaults ?? { video: "", videoI2V: "", videoR2V: "" };
+    const usesReferenceImages = next.generationRoute === "reference_video";
+    const before = executingVideoModel(models, globals, basics.generationRoute === "reference_video");
+    const after = executingVideoModel(models, globals, usesReferenceImages);
+    const modelChanged = before !== after;
+    const nextDurations = catalogDurations(step2Data?.providers ?? [], step2Data?.customProviders ?? [], after);
+    setModels((prev) => ({
+      ...prev,
+      videoResolution: modelChanged ? null : prev.videoResolution,
+      defaultDuration:
+        prev.defaultDuration !== null && nextDurations?.includes(prev.defaultDuration)
+          ? prev.defaultDuration
+          : null,
+    }));
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-
-    if (!title.trim()) {
-      setTitleError("项目标题不能为空");
-      return;
-    }
-
-    setCreatingProject(true);
+  const handleCreate = async () => {
+    // 生成模式必选（Step1 已拦一道）：缺失时后端返回 422，此处不构造缺少生成模式的创建请求
+    if (!basics.generationRoute) return;
+    setCreating(true);
     try {
-      const response = await API.createProject(title.trim(), style, contentMode);
-      const projectName = response.name;
+      // resolution 的 model_settings key 用执行模型：后端按执行模型查这张表，向导只暴露默认层，
+      // 但全局细分层若指向别的模型，执行的就不是默认层那个——键位对不上分辨率会被静默忽略。
+      const globals = step2Data?.globalDefaults ?? { video: "", videoI2V: "", videoR2V: "", image: "", imageT2I: "" };
+      const executingVideo = executingVideoModel(models, globals, basics.generationRoute === "reference_video");
+      const executingImage = executingImageModel(models, globals);
+      const modelSettings: Record<string, { resolution: string }> = {};
+      if (executingVideo && models.videoResolution) {
+        modelSettings[executingVideo] = { resolution: models.videoResolution };
+      }
+      if (executingImage && models.imageResolution) {
+        modelSettings[executingImage] = { resolution: models.imageResolution };
+      }
 
-      // 如果用户选择了风格参考图，在项目创建后上传
-      if (styleImageFile) {
+      const isAd = basics.contentMode === "ad";
+      const resp = await API.createProject({
+        title: basics.title.trim(),
+        content_mode: basics.contentMode,
+        // source_kind 仅 drama 暴露与生效；其余模式由服务端缺省 novel
+        ...(basics.contentMode === "drama" ? { source_kind: basics.sourceKind } : {}),
+        aspect_ratio: basics.aspectRatio,
+        generation_mode: basics.generationRoute,
+        grid_storyboard: basics.gridStoryboard,
+        // 口播语速估算未填即不传（服务端不落盘，回退语言默认）
+        ...(basics.speechRate !== null ? { speech_rate_units_per_second: basics.speechRate } : {}),
+        // ad 不暴露 default_duration（按目标总时长逐个分镜规划），改传 target_duration
+        ...(isAd
+          ? { target_duration: basics.targetDuration }
+          : {
+              default_duration: models.defaultDuration,
+              // 未设目标即不传（服务端不落盘，脚本规划不注入该软约束）
+              ...(basics.episodeTargetDuration !== null
+                ? { episode_target_duration: basics.episodeTargetDuration }
+                : {}),
+            }),
+        style_template_id: style.mode === "template" ? style.templateId : null,
+        video_backend: models.videoBackend || null,
+        default_image_backend: models.imageBackendDefault || null,
+        default_text_backend: models.textBackendDefault || null,
+        text_backend_simple: models.textBackendSimple || null,
+        text_backend_complex: models.textBackendComplex || null,
+        ...(Object.keys(modelSettings).length > 0 ? { model_settings: modelSettings } : {}),
+      });
+
+      // Upload style image if in custom mode
+      if (style.mode === "custom" && style.uploadedFile) {
         try {
-          await API.uploadStyleImage(projectName, styleImageFile);
+          await API.uploadStyleImage(resp.name, style.uploadedFile);
         } catch {
-          // 风格图上传失败不阻塞项目创建
           useAppStore.getState().pushToast(
-            "风格参考图上传失败，可稍后在项目设置中重新上传",
+            t("dashboard:style_upload_failed_hint"),
             "warning"
           );
         }
       }
 
       setShowCreateModal(false);
-      navigate(`/app/projects/${projectName}`);
+      navigate(`/app/projects/${resp.name}`);
     } catch (err) {
       useAppStore.getState().pushToast(
-        `创建项目失败: ${(err as Error).message}`,
+        `${t("dashboard:create_project_failed")}${errMsg(err)}`,
         "error"
       );
     } finally {
-      setCreatingProject(false);
+      setCreating(false);
     }
   };
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-      <div className="w-full max-w-md rounded-xl border border-gray-700 bg-gray-900 p-6 shadow-2xl">
-        {/* Header */}
-        <div className="flex items-center justify-between mb-5">
-          <h2 className="text-lg font-semibold text-gray-100">新建项目</h2>
+  const stepKicker = `Reel ${step.toString().padStart(2, "0")} / 03`;
+
+  const modal = (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center px-4"
+      style={{
+        background:
+          "radial-gradient(900px 480px at 12% -10%, oklch(0.32 0.05 295 / 0.30), transparent 55%), radial-gradient(800px 460px at 100% 110%, oklch(0.26 0.04 260 / 0.28), transparent 55%), oklch(0 0 0 / 0.62)",
+        backdropFilter: "blur(12px) saturate(1.1)",
+        WebkitBackdropFilter: "blur(12px) saturate(1.1)",
+      }}
+    >
+      {/* 遮罩层：点击关闭。键盘路径走 Esc。 */}
+      <button
+        type="button"
+        aria-label={t("common:close")}
+        tabIndex={-1}
+        onClick={handleClose}
+        className="absolute inset-0 cursor-default bg-transparent"
+      />
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-project-title"
+        className="relative w-full max-w-3xl overflow-hidden rounded-[14px] border border-hairline bg-bg-grad-a/95 shadow-[0_40px_100px_-30px_oklch(0_0_0_/_0.85)] backdrop-blur-md max-h-[92vh] flex flex-col"
+        style={{
+          background:
+            "linear-gradient(180deg, oklch(0.20 0.012 270 / 0.95), oklch(0.16 0.010 265 / 0.95))",
+        }}
+      >
+        {/* Hero header */}
+        <div className="relative shrink-0 px-7 pt-6 pb-5">
+          {/* 角落装饰 — 取景框的轮廓 */}
+          <div
+            aria-hidden
+            className="pointer-events-none absolute left-3 top-3 h-3 w-3 border-l border-t border-accent/40"
+          />
+          <div
+            aria-hidden
+            className="pointer-events-none absolute right-3 top-3 h-3 w-3 border-r border-t border-accent/40"
+          />
+
           <button
             type="button"
-            onClick={() => setShowCreateModal(false)}
-            className="rounded p-1 text-gray-400 hover:bg-gray-800 hover:text-gray-200"
+            onClick={handleClose}
+            aria-label={t("common:close")}
+            className="absolute right-5 top-5 grid h-8 w-8 place-items-center rounded-md border border-hairline-soft bg-bg/55 text-text-3 transition-colors hover:border-hairline hover:bg-bg hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           >
-            <X className="h-5 w-5" />
+            <X className="h-4 w-4" />
           </button>
+
+          <div className="font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-accent-2">
+            {stepKicker}
+          </div>
+          <h2
+            id="create-project-title"
+            className="font-editorial mt-1.5"
+            style={{
+              fontWeight: 400,
+              fontSize: 36,
+              lineHeight: 1.05,
+              letterSpacing: "-0.012em",
+              color: "var(--color-text)",
+            }}
+          >
+            {t("dashboard:new_project")}
+          </h2>
+          <p className="mt-1.5 text-[12.5px] leading-[1.55] text-text-3">
+            {t("templates:wizard_step_basics")}
+            <span aria-hidden className="mx-1.5 text-text-4">/</span>
+            {t("templates:wizard_step_models")}
+            <span aria-hidden className="mx-1.5 text-text-4">/</span>
+            {t("templates:wizard_step_style")}
+          </p>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {/* Title */}
-          <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">
-              项目标题 <span className="text-red-400">*</span>
-            </label>
-            <input
-              type="text"
-              value={title}
-              onChange={(e) => {
-                setTitle(e.target.value);
-                setTitleError("");
-              }}
-              placeholder="例如：重生之皇后威武"
-              className="w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-200 placeholder-gray-500 outline-none focus:border-indigo-500"
+        {/* Step indicator strip */}
+        <div className="shrink-0 border-y border-hairline-soft bg-[oklch(0.16_0.010_265_/_0.55)] px-6">
+          <StepIndicator current={step} />
+        </div>
+
+        {/* Current step body */}
+        <div className="min-h-0 flex-1 overflow-y-auto px-7 pt-6 pb-7">
+          {step === 1 && (
+            <WizardStep1Basics
+              value={basics}
+              onChange={handleBasicsChange}
+              onNext={() => setStep(2)}
+              onCancel={handleClose}
             />
-            {titleError && (
-              <p className="mt-1 text-xs text-red-400">{titleError}</p>
-            )}
-            <p className="mt-1 text-xs text-gray-600">
-              系统会自动生成内部项目标识并用于 URL 与文件存储
-            </p>
-          </div>
-
-          {/* Content Mode */}
-          <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">
-              内容模式
-            </label>
-            <div className="flex gap-3">
-              <label className={`flex-1 cursor-pointer rounded-lg border px-3 py-2 text-center text-sm transition-colors ${
-                contentMode === "narration"
-                  ? "border-indigo-500 bg-indigo-500/10 text-indigo-300"
-                  : "border-gray-700 bg-gray-800 text-gray-400 hover:border-gray-600"
-              }`}>
-                <input
-                  type="radio"
-                  name="contentMode"
-                  value="narration"
-                  checked={contentMode === "narration"}
-                  onChange={() => setContentMode("narration")}
-                  className="sr-only"
-                />
-                说书+画面
-              </label>
-              <label className={`flex-1 cursor-pointer rounded-lg border px-3 py-2 text-center text-sm transition-colors ${
-                contentMode === "drama"
-                  ? "border-indigo-500 bg-indigo-500/10 text-indigo-300"
-                  : "border-gray-700 bg-gray-800 text-gray-400 hover:border-gray-600"
-              }`}>
-                <input
-                  type="radio"
-                  name="contentMode"
-                  value="drama"
-                  checked={contentMode === "drama"}
-                  onChange={() => setContentMode("drama")}
-                  className="sr-only"
-                />
-                剧集动画
-              </label>
-            </div>
-          </div>
-
-          {/* Style — fixed radio options */}
-          <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">
-              视觉风格
-            </label>
-            <div className="flex gap-2">
-              {STYLE_OPTIONS.map((opt) => (
-                <label
-                  key={opt.value}
-                  className={`flex-1 cursor-pointer rounded-lg border px-3 py-2 text-center text-sm transition-colors ${
-                    style === opt.value
-                      ? "border-indigo-500 bg-indigo-500/10 text-indigo-300"
-                      : "border-gray-700 bg-gray-800 text-gray-400 hover:border-gray-600"
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    name="style"
-                    value={opt.value}
-                    checked={style === opt.value}
-                    onChange={() => setStyle(opt.value)}
-                    className="sr-only"
-                  />
-                  {opt.label}
-                </label>
-              ))}
-            </div>
-          </div>
-
-          {/* Style reference image */}
-          <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">
-              风格参考图 <span className="text-xs text-gray-600 font-normal">（可选）</span>
-            </label>
-            {styleImagePreview ? (
-              <div className="relative rounded-lg border border-gray-700 overflow-hidden">
-                <img
-                  src={styleImagePreview}
-                  alt="风格参考图预览"
-                  className="w-full h-32 object-cover"
-                />
-                <button
-                  type="button"
-                  onClick={clearStyleImage}
-                  className="absolute top-1.5 right-1.5 rounded-full bg-gray-900/80 p-1 text-gray-300 hover:bg-gray-900 hover:text-white transition-colors"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-gray-700 bg-gray-800/50 px-3 py-4 text-sm text-gray-500 transition-colors hover:border-gray-500 hover:text-gray-300"
-              >
-                <Upload className="h-4 w-4" />
-                上传参考图片
-              </button>
-            )}
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".png,.jpg,.jpeg,.webp"
-              onChange={handleStyleImageChange}
-              className="hidden"
+          )}
+          {step === 2 && (
+            <WizardStep2Models
+              value={models}
+              onChange={setModels}
+              onBack={() => setStep(1)}
+              onNext={() => setStep(3)}
+              onCancel={handleClose}
+              data={step2Data}
+              error={step2Error}
+              hideDuration={basics.contentMode === "ad"}
+              usesReferenceImages={basics.generationRoute === "reference_video"}
             />
-            <p className="mt-1 text-xs text-gray-600">
-              上传后将自动分析风格特征，用于生成一致的画面
-            </p>
-          </div>
-
-          {/* Submit */}
-          <button
-            type="submit"
-            disabled={creatingProject || !title.trim()}
-            className="w-full rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-indigo-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {creatingProject ? (
-              <span className="inline-flex items-center gap-2">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                创建中...
-              </span>
-            ) : (
-              "创建项目"
-            )}
-          </button>
-        </form>
+          )}
+          {step === 3 && (
+            <WizardStep3Style
+              value={style}
+              onChange={setStyle}
+              onBack={() => setStep(2)}
+              onCreate={voidPromise(handleCreate)}
+              onCancel={handleClose}
+              creating={creating}
+            />
+          )}
+        </div>
       </div>
     </div>
   );
+
+  return createPortal(modal, document.body);
 }

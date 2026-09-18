@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
-import httpx
-
-from lib.grok_shared import create_grok_client
+from lib.grok_shared import create_grok_client, grok_should_retry
 from lib.image_backends.base import (
     ImageCapability,
     ImageGenerationRequest,
     ImageGenerationResult,
+    download_image_to_path,
     image_to_base64_data_uri,
 )
+from lib.logging_utils import format_kwargs_for_log
 from lib.providers import PROVIDER_GROK
+from lib.retry import with_retry_async
 
 logger = logging.getLogger(__name__)
 
@@ -73,27 +75,38 @@ class GrokImageBackend:
     def capabilities(self) -> set[ImageCapability]:
         return self._capabilities
 
+    @property
+    def max_reference_images(self) -> int:
+        # Grok 不按数量裁剪参考图，全量随请求发出。
+        return 0
+
+    @with_retry_async(retry_if=grok_should_retry)
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         """生成图片（T2I 或 I2I）。"""
         generate_kwargs: dict = {
             "prompt": request.prompt,
             "model": self._model,
             "aspect_ratio": _validate_aspect_ratio(request.aspect_ratio),
-            "resolution": _map_image_size_to_resolution(request.image_size),
         }
+        if request.image_size is not None:
+            generate_kwargs["resolution"] = request.image_size
 
         # I2I：将所有参考图转为 base64 data URI 列表
         if request.reference_images:
-            data_uris = []
-            for ref in request.reference_images:
-                ref_path = Path(ref.path)
-                if ref_path.exists():
-                    data_uris.append(image_to_base64_data_uri(ref_path))
+            # exists() 只读本地文件元数据，不阻塞；读整张图做 base64 编码才是阻塞 I/O，
+            # 逐张卸载到线程后并发等待，避免堵住事件循环
+            existing_paths = [ref_path for ref in request.reference_images if (ref_path := Path(ref.path)).exists()]
+            data_uris = list(
+                await asyncio.gather(
+                    *[asyncio.to_thread(image_to_base64_data_uri, ref_path) for ref_path in existing_paths]
+                )
+            )
             if data_uris:
                 generate_kwargs["image_urls"] = data_uris
                 logger.info("Grok I2I 模式: %d 张参考图", len(data_uris))
 
         logger.info("Grok 图片生成开始: model=%s", self._model)
+        logger.info("调用 %s 图片 SDK kwargs=%s", self.name, format_kwargs_for_log(generate_kwargs))
         response = await self._client.image.sample(**generate_kwargs)
 
         # 审核检查
@@ -101,7 +114,7 @@ class GrokImageBackend:
             raise RuntimeError("Grok 图片生成被内容审核拒绝")
 
         # 下载图片到本地
-        await _download_image(response.url, request.output_path)
+        await download_image_to_path(response.url, request.output_path)
 
         logger.info("Grok 图片下载完成: %s", request.output_path)
 
@@ -111,23 +124,3 @@ class GrokImageBackend:
             model=self._model,
             image_uri=response.url,
         )
-
-
-def _map_image_size_to_resolution(image_size: str) -> str:
-    """将通用 image_size（如 '1K', '2K'）映射为 Grok resolution 参数。"""
-    mapping = {
-        "1K": "1k",
-        "2K": "2k",
-        "1k": "1k",
-        "2k": "2k",
-    }
-    return mapping.get(image_size, "1k")
-
-
-async def _download_image(url: str, output_path: Path, *, timeout: int = 60) -> None:
-    """从 URL 下载图片到本地文件。"""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    async with httpx.AsyncClient() as http_client:
-        resp = await http_client.get(url, timeout=timeout)
-        resp.raise_for_status()
-        output_path.write_bytes(resp.content)

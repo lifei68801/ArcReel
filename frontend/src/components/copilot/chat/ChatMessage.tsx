@@ -1,7 +1,16 @@
+import { useTranslation } from "react-i18next";
 import type { ContentBlock, Turn } from "@/types";
 import { cn } from "./utils";
 import { getRoleLabel } from "./utils";
 import { ContentBlockRenderer } from "./ContentBlockRenderer";
+import { AgentFailureCard } from "./AgentFailureCard";
+import {
+  BUBBLE_LABEL_CLASS,
+  BUBBLE_LABEL_STYLE,
+  BUBBLE_SHELL_CLASS,
+  USER_BUBBLE_LAYOUT_CLASS,
+  USER_BUBBLE_STYLE,
+} from "./bubble";
 
 // ---------------------------------------------------------------------------
 // ChatMessage – renders a full conversation turn (user, assistant, or system).
@@ -11,9 +20,14 @@ import { ContentBlockRenderer } from "./ContentBlockRenderer";
 
 interface ChatMessageProps {
   message: Turn;
+  /** 该 turn 是流式草稿（draft）——末尾块处于生成中。 */
+  streaming?: boolean;
 }
 
-export function ChatMessage({ message }: ChatMessageProps) {
+export function ChatMessage({ message, streaming }: ChatMessageProps) {
+  // hook 必须在下面各处早退之前调用。
+  const { t } = useTranslation("dashboard");
+
   if (!message) return null;
 
   const messageType = typeof message.type === "string" ? message.type : "";
@@ -31,27 +45,51 @@ export function ChatMessage({ message }: ChatMessageProps) {
     return null;
   }
 
+  // Agent 故障是写入点定型的系统事件，不套用普通消息气泡或“系统”角色标签。
+  const soleBlock = blocks.length === 1 ? blocks[0] : undefined;
+  if (messageType === "system" && soleBlock?.type === "agent_failure" && soleBlock.failure) {
+    return <AgentFailureCard failure={soleBlock.failure} />;
+  }
+
   // Determine styling based on message type
   const isUser = messageType === "user";
   const isSystem = messageType === "system";
 
-  const containerClass = isUser
-    ? "ml-4 bg-neon-500/15 border-neon-400/25"
+  const containerStyle: React.CSSProperties = isUser
+    ? USER_BUBBLE_STYLE
     : isSystem
-      ? "bg-slate-800/30 border-slate-600/20"
-      : "bg-white/5 border-white/10";
+      ? {
+          background: "oklch(0.22 0.011 265 / 0.5)",
+          border: "1px solid var(--color-hairline-soft)",
+        }
+      : {
+          background: "oklch(0.21 0.012 265 / 0.5)",
+          border: "1px solid var(--color-hairline-soft)",
+        };
+
+  const labelStyle: React.CSSProperties = {
+    ...BUBBLE_LABEL_STYLE,
+    color: isUser ? "var(--color-accent-2)" : "var(--color-text-4)",
+  };
 
   return (
-    <article className={cn("rounded-xl px-3 py-2 border min-w-0", containerClass)}>
-      <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">
-        {getRoleLabel(messageType)}
+    <article
+      className={cn(BUBBLE_SHELL_CLASS, "min-w-0", isUser && USER_BUBBLE_LAYOUT_CLASS)}
+      style={containerStyle}
+    >
+      <div className={BUBBLE_LABEL_CLASS} style={labelStyle}>
+        {getRoleLabel(messageType, t)}
       </div>
-      <div className="text-sm text-slate-100 leading-6 min-w-0 overflow-hidden">
+      <div
+        className="min-w-0 overflow-hidden text-[12.5px] leading-[1.55]"
+        style={{ color: "var(--color-text)" }}
+      >
         {blocks.map((block, index) => (
           <ContentBlockRenderer
             key={block.id ?? index}
             block={block}
             index={index}
+            streaming={Boolean(streaming) && index === blocks.length - 1}
           />
         ))}
       </div>

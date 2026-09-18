@@ -1,22 +1,26 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { ChevronDown } from "lucide-react";
 import { AutoTextarea } from "@/components/ui/AutoTextarea";
 import { CompactInput } from "@/components/ui/CompactInput";
 import { DropdownPill } from "@/components/ui/DropdownPill";
-import { DialogueListEditor } from "./DialogueListEditor";
-import { CAMERA_MOTIONS } from "@/types";
-import type { VideoPrompt, CameraMotion, Dialogue } from "@/types";
+import { CAMERA_MOTIONS, CAMERA_MOTION_I18N_KEYS } from "@/types";
+import type { VideoPrompt, CameraMotion } from "@/types";
 
 interface VideoPromptEditorProps {
   prompt: VideoPrompt;
   onUpdate: (patch: Partial<VideoPrompt>) => void;
+  /** 只读展示（引导演示项目）：字段可读不可改。 */
+  readOnly?: boolean;
 }
 
 /** Structured editor for VideoPrompt fields with collapsible metadata section. */
 export function VideoPromptEditor({
   prompt,
   onUpdate,
+  readOnly,
 }: VideoPromptEditorProps) {
+  const { t } = useTranslation("dashboard");
   const [collapsed, setCollapsed] = useState(false);
 
   return (
@@ -24,7 +28,8 @@ export function VideoPromptEditor({
       <AutoTextarea
         value={prompt.action}
         onChange={(v) => onUpdate({ action: v })}
-        placeholder="视频动作描述..."
+        readOnly={readOnly}
+        placeholder={t("video_prompt_placeholder")}
       />
 
       {/* Collapsible metadata fields */}
@@ -36,26 +41,25 @@ export function VideoPromptEditor({
         <ChevronDown
           className={`h-3 w-3 transition-transform ${collapsed ? "-rotate-90" : ""}`}
         />
-        运镜 / 音效 / 对话
+        {t("camera_motion_section")}
       </button>
 
       {!collapsed && (
         <div className="flex flex-col gap-2 pl-1">
           <DropdownPill
-            label="镜头运动"
+            label={t("camera_motion_label")}
             value={prompt.camera_motion}
             options={CAMERA_MOTIONS}
+            renderOption={(v: CameraMotion) => t(CAMERA_MOTION_I18N_KEYS[v])}
+            disabled={readOnly}
             onChange={(v: CameraMotion) => onUpdate({ camera_motion: v })}
           />
           <CompactInput
-            label="环境音效"
+            label={t("ambiance_audio_label")}
             value={prompt.ambiance_audio}
             onChange={(v) => onUpdate({ ambiance_audio: v })}
-            placeholder="环境音效描述..."
-          />
-          <DialogueListEditor
-            dialogue={prompt.dialogue ?? []}
-            onChange={(d: Dialogue[]) => onUpdate({ dialogue: d })}
+            readOnly={readOnly}
+            placeholder={t("ambiance_audio_placeholder")}
           />
         </div>
       )}

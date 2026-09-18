@@ -1,21 +1,27 @@
 """文本生成服务层公共 API。"""
 
 from lib.text_backends.base import (
+    TEXT_TASK_TIERS,
+    VISION_REQUIRED_TASKS,
     ImageInput,
     TextBackend,
     TextCapability,
     TextGenerationRequest,
     TextGenerationResult,
+    TextTaskTier,
     TextTaskType,
 )
 from lib.text_backends.registry import create_backend, get_registered_backends, register_backend
 
 __all__ = [
+    "TEXT_TASK_TIERS",
+    "VISION_REQUIRED_TASKS",
     "ImageInput",
     "TextBackend",
     "TextCapability",
     "TextGenerationRequest",
     "TextGenerationResult",
+    "TextTaskTier",
     "TextTaskType",
     "create_backend",
     "get_registered_backends",
@@ -28,10 +34,11 @@ from lib.text_backends.gemini import GeminiTextBackend
 
 register_backend(PROVIDER_GEMINI, GeminiTextBackend)
 
-from lib.providers import PROVIDER_ARK
+from lib.providers import PROVIDER_ARK, PROVIDER_ARK_AGENT_PLAN
 from lib.text_backends.ark import ArkTextBackend
 
 register_backend(PROVIDER_ARK, ArkTextBackend)
+register_backend(PROVIDER_ARK_AGENT_PLAN, ArkTextBackend)
 
 from lib.providers import PROVIDER_GROK
 from lib.text_backends.grok import GrokTextBackend
@@ -42,3 +49,8 @@ from lib.providers import PROVIDER_OPENAI
 from lib.text_backends.openai import OpenAITextBackend
 
 register_backend(PROVIDER_OPENAI, OpenAITextBackend)
+
+from lib.providers import PROVIDER_AGNES
+from lib.text_backends.agnes import AgnesTextBackend
+
+register_backend(PROVIDER_AGNES, AgnesTextBackend)

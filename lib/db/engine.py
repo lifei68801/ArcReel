@@ -7,7 +7,6 @@ import contextlib
 import logging
 import os
 from collections.abc import AsyncGenerator
-from pathlib import Path
 
 from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
@@ -30,8 +29,9 @@ def get_database_url() -> str:
     url = os.environ.get("DATABASE_URL", "").strip()
     if url:
         return url
-    project_root = Path(__file__).parent.parent.parent
-    db_path = project_root / "projects" / ".arcreel.db"
+    from lib.app_data_dir import app_data_dir
+
+    db_path = app_data_dir() / ".arcreel.db"
     return f"sqlite+aiosqlite:///{db_path}"
 
 
@@ -60,9 +60,10 @@ def _create_engine():
     )
 
     if _is_sqlite:
-
+        # 由 SQLAlchemy 的 event.listens_for 注册，模块内无其它引用；basedpyright 把函数作用域内的
+        # 符号一律判为私有，本处的 reportUnusedFunction 是工具误报。
         @event.listens_for(engine.sync_engine, "connect")
-        def _set_sqlite_pragma(dbapi_conn, connection_record):
+        def _set_sqlite_pragma(dbapi_conn, connection_record):  # pyright: ignore[reportUnusedFunction]
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA busy_timeout=30000")

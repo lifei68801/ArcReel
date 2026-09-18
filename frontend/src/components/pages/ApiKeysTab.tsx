@@ -1,40 +1,61 @@
+
 /**
- * API Keys 管理 Tab
- * 列表展示、创建（弹窗显示完整 key）、删除（确认弹窗）
+ * API Keys 管理 Tab — Darkroom redesign
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  AlertTriangle,
-  Check,
-  Copy,
-  KeyRound,
-  Loader2,
-  Plus,
-  Trash2,
-  X,
-} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useAutoFocus } from "@/hooks/useAutoFocus";
+import { useEscapeClose } from "@/hooks/useEscapeClose";
+import { AlertTriangle, KeyRound, Loader2, Plus, Trash2, X } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { API } from "@/api";
 import { useAppStore } from "@/stores/app-store";
-import { copyText } from "@/utils/clipboard";
+import { CopyButton } from "@/components/ui/CopyButton";
+import { errMsg } from "@/utils/async";
+import { formatDate } from "@/utils/date-format";
+import {
+  ACCENT_BTN_CLS,
+  ACCENT_BUTTON_STYLE,
+  CARD_STYLE,
+  ICON_BTN_FILLED_CLS,
+  INPUT_CLS,
+} from "@/components/ui/darkroom-tokens";
 import type { ApiKeyInfo, CreateApiKeyResponse } from "@/types";
+
+const MODAL_STYLE: CSSProperties = {
+  background:
+    "linear-gradient(180deg, oklch(0.21 0.012 270 / 0.96), oklch(0.16 0.010 265 / 0.96))",
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function formatDate(iso: string | null): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  return d.toLocaleDateString("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-}
+const FULL_DATE_OPTS: Intl.DateTimeFormatOptions = {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+};
 
 function isExpired(expiresAt: string | null): boolean {
   if (!expiresAt) return false;
   return new Date(expiresAt) < new Date();
+}
+
+// ---------------------------------------------------------------------------
+// Corner brackets — cinematic frame
+// ---------------------------------------------------------------------------
+
+function CornerBrackets() {
+  const cornerCls =
+    "pointer-events-none absolute h-3 w-3 border-accent-2";
+  return (
+    <>
+      <span aria-hidden className={`${cornerCls} left-2 top-2 border-l border-t`} />
+      <span aria-hidden className={`${cornerCls} right-2 top-2 border-r border-t`} />
+      <span aria-hidden className={`${cornerCls} left-2 bottom-2 border-l border-b`} />
+      <span aria-hidden className={`${cornerCls} right-2 bottom-2 border-r border-b`} />
+    </>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -47,20 +68,19 @@ interface CreateModalProps {
 }
 
 function CreateModal({ onClose, onCreated }: CreateModalProps) {
+  const { t } = useTranslation("dashboard");
   const [name, setName] = useState("");
   const [expiresDays, setExpiresDays] = useState<number | "">(30);
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<CreateApiKeyResponse | null>(null);
-  const [copied, setCopied] = useState(false);
 
   const canCreate = useMemo(() => name.trim().length > 0, [name]);
+  const nameInputRef = useAutoFocus<HTMLInputElement>();
 
   const handleCreate = useCallback(async () => {
     if (!canCreate || creating) return;
     setCreating(true);
     try {
-      // expiresDays === "" 或 0 时发送 0（后端解释为永不过期）；
-      // 正整数直接传递；undefined 让后端使用默认值（30天）。
       const days: number | undefined = expiresDays === "" ? 0 : expiresDays;
       const res = await API.createApiKey(name.trim(), days);
       setCreated(res);
@@ -73,441 +93,407 @@ function CreateModal({ onClose, onCreated }: CreateModalProps) {
         last_used_at: null,
       });
     } catch (err) {
-      useAppStore.getState().pushToast(`创建失败: ${(err as Error).message}`, "error");
+      useAppStore.getState().pushToast(t("create_failed", { message: errMsg(err) }), "error");
     } finally {
       setCreating(false);
     }
-  }, [canCreate, creating, expiresDays, name, onCreated]);
+  }, [canCreate, creating, expiresDays, name, onCreated, t]);
 
-  const handleCopy = useCallback(async () => {
-    if (!created?.key) return;
-    await copyText(created.key);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  }, [created?.key]);
+  useEscapeClose(onClose);
 
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Enter" && !created && canCreate) void handleCreate();
-      if (e.key === "Escape") onClose();
-    },
-    [canCreate, created, handleCreate, onClose],
-  );
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [canCreate, created, handleCreate]);
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4"
-      onKeyDown={handleKeyDown}
+      role="dialog"
+      aria-modal="true"
+      className="fixed inset-0 z-50 flex items-center justify-center px-4"
+      style={{
+        background:
+          "radial-gradient(800px 500px at 50% 30%, oklch(0.30 0.04 295 / 0.20), transparent 60%), oklch(0 0 0 / 0.62)",
+        backdropFilter: "blur(8px)",
+        WebkitBackdropFilter: "blur(8px)",
+      }}
     >
-      <div className="w-full max-w-md rounded-2xl border border-gray-800 bg-gray-900 shadow-2xl shadow-black/50">
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-gray-800 px-5 py-4">
-          <div className="flex items-center gap-2.5">
-            <div className="rounded-lg border border-indigo-500/30 bg-indigo-500/10 p-1.5 text-indigo-400">
-              <KeyRound className="h-4 w-4" />
+      <div
+        className="relative w-full max-w-md overflow-hidden rounded-[14px] border border-hairline p-6"
+        style={MODAL_STYLE}
+      >
+        <CornerBrackets />
+        <div className="mb-5 flex items-center justify-between">
+          <div>
+            <div className="font-mono text-[10px] font-bold uppercase tracking-[0.18em] text-accent-2">
+              {created ? "Key Issued" : "New Token"}
             </div>
-            <h2 className="text-sm font-semibold text-gray-100">
-              {created ? "API Key 已创建" : "新建 API Key"}
-            </h2>
+            <h3
+              className="font-editorial mt-1"
+              style={{
+                fontSize: 22,
+                fontWeight: 400,
+                lineHeight: 1.1,
+                letterSpacing: "-0.012em",
+                color: "var(--color-text)",
+              }}
+            >
+              {created ? t("key_created") : t("new_api_key")}
+            </h3>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-md p-1 text-gray-500 transition-colors hover:bg-gray-800 hover:text-gray-300 focus-visible:ring-2 focus-visible:ring-indigo-500/60 focus-visible:outline-none"
-            aria-label="关闭"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-
-        <div className="p-5">
-          {created ? (
-            /* ——— 创建成功视图 ——— */
-            <div className="space-y-4">
-              {/* 仅此一次警告 */}
-              <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/20 bg-amber-500/8 px-3 py-3">
-                <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-400" />
-                <p className="text-xs leading-5 text-amber-200">
-                  请立即复制并妥善保存此 API Key。出于安全考量，完整密钥<strong className="font-semibold"> 仅在创建时显示一次</strong>，关闭后将无法再次查看。
-                </p>
-              </div>
-
-              {/* 密钥展示 */}
-              <div>
-                <div className="mb-1.5 text-xs font-medium text-gray-400">你的 API Key</div>
-                <div className="group relative flex items-center gap-2 rounded-xl border border-gray-700 bg-gray-950 px-3 py-2.5">
-                  <code className="flex-1 overflow-x-auto whitespace-nowrap font-mono text-xs text-indigo-300 scrollbar-none">
-                    {created.key}
-                  </code>
-                  <button
-                    type="button"
-                    onClick={() => void handleCopy()}
-                    className="flex-shrink-0 rounded-md p-1 text-gray-500 transition-colors hover:bg-gray-800 hover:text-gray-200 focus-visible:ring-2 focus-visible:ring-indigo-500/60 focus-visible:outline-none"
-                    aria-label="复制密钥"
-                  >
-                    {copied ? (
-                      <Check className="h-3.5 w-3.5 text-emerald-400" />
-                    ) : (
-                      <Copy className="h-3.5 w-3.5" />
-                    )}
-                  </button>
-                </div>
-              </div>
-
-              {/* 元信息 */}
-              <div className="grid grid-cols-2 gap-3 text-xs">
-                <div className="rounded-lg border border-gray-800 bg-gray-950/50 px-3 py-2">
-                  <div className="text-gray-500">名称</div>
-                  <div className="mt-0.5 truncate font-medium text-gray-200">{created.name}</div>
-                </div>
-                <div className="rounded-lg border border-gray-800 bg-gray-950/50 px-3 py-2">
-                  <div className="text-gray-500">前缀</div>
-                  <div className="mt-0.5 font-mono font-medium text-gray-200">{created.key_prefix}…</div>
-                </div>
-              </div>
-
-              <button
-                type="button"
-                onClick={onClose}
-                className="w-full rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:ring-2 focus-visible:ring-indigo-500/60 focus-visible:outline-none"
-              >
-                已复制，关闭
-              </button>
-            </div>
-          ) : (
-            /* ——— 创建表单视图 ——— */
-            <div className="space-y-4">
-              <div>
-                <label className="mb-1.5 block text-xs font-medium text-gray-300">
-                  名称 <span className="text-rose-400">*</span>
-                </label>
-                <input
-                  type="text"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="例如：OpenClaw 集成"
-                  autoFocus
-                  className="w-full rounded-xl border border-gray-700 bg-gray-950 px-3 py-2.5 text-sm text-gray-200 placeholder:text-gray-600 focus:border-indigo-500/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
-                />
-              </div>
-
-              <div>
-                <label className="mb-1.5 block text-xs font-medium text-gray-300">
-                  有效期（天）
-                </label>
-                <input
-                  type="number"
-                  min={1}
-                  max={3650}
-                  value={expiresDays}
-                  onChange={(e) =>
-                    setExpiresDays(e.target.value === "" ? "" : Number(e.target.value))
-                  }
-                  placeholder="留空则不过期"
-                  className="w-full rounded-xl border border-gray-700 bg-gray-950 px-3 py-2.5 text-sm text-gray-200 placeholder:text-gray-600 focus:border-indigo-500/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
-                />
-                <p className="mt-1 text-xs text-gray-600">默认 30 天；留空则永不过期</p>
-              </div>
-
-              <div className="flex gap-2 pt-1">
-                <button
-                  type="button"
-                  onClick={onClose}
-                  className="flex-1 rounded-xl border border-gray-700 bg-gray-900 px-4 py-2.5 text-sm text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-800 focus-visible:ring-2 focus-visible:ring-indigo-500/60 focus-visible:outline-none"
-                >
-                  取消
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleCreate()}
-                  disabled={!canCreate || creating}
-                  className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-indigo-500/60 focus-visible:outline-none"
-                >
-                  {creating ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Plus className="h-4 w-4" />
-                  )}
-                  {creating ? "创建中…" : "创建"}
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Delete Confirm Modal
-// ---------------------------------------------------------------------------
-
-interface DeleteModalProps {
-  keyInfo: ApiKeyInfo;
-  onClose: () => void;
-  onDeleted: (keyId: number) => void;
-}
-
-function DeleteModal({ keyInfo, onClose, onDeleted }: DeleteModalProps) {
-  const [deleting, setDeleting] = useState(false);
-
-  const handleDelete = useCallback(async () => {
-    if (deleting) return;
-    setDeleting(true);
-    try {
-      await API.deleteApiKey(keyInfo.id);
-      onDeleted(keyInfo.id);
-    } catch (err) {
-      useAppStore.getState().pushToast(`删除失败: ${(err as Error).message}`, "error");
-    } finally {
-      setDeleting(false);
-    }
-  }, [deleting, keyInfo.id, onDeleted]);
-
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    },
-    [onClose],
-  );
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4"
-      onKeyDown={handleKeyDown}
-    >
-      <div className="w-full max-w-sm rounded-2xl border border-gray-800 bg-gray-900 shadow-2xl shadow-black/50">
-        <div className="p-5">
-          <div className="flex items-start gap-3">
-            <div className="mt-0.5 rounded-full bg-rose-500/10 p-2 text-rose-400">
-              <Trash2 className="h-4 w-4" />
-            </div>
-            <div>
-              <h2 className="text-sm font-semibold text-gray-100">吊销 API Key</h2>
-              <p className="mt-1.5 text-xs leading-5 text-gray-400">
-                将永久吊销{" "}
-                <span className="font-mono text-gray-200">{keyInfo.key_prefix}…</span>（{keyInfo.name}）。
-                使用此 Key 的服务将立即失去访问权限，且操作不可撤销。
-              </p>
-            </div>
-          </div>
-
-          <div className="mt-5 flex gap-2">
+          {!creating && (
             <button
               type="button"
               onClick={onClose}
-              disabled={deleting}
-              className="flex-1 rounded-xl border border-gray-700 bg-gray-900 px-4 py-2.5 text-sm text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-indigo-500/60 focus-visible:outline-none"
+              className={ICON_BTN_FILLED_CLS}
+              aria-label={t("common:cancel")}
             >
-              取消
+              <X className="h-4 w-4" />
             </button>
-            <button
-              type="button"
-              onClick={() => void handleDelete()}
-              disabled={deleting}
-              className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-rose-600 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-rose-500/60 focus-visible:outline-none"
-            >
-              {deleting ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Trash2 className="h-4 w-4" />
-              )}
-              {deleting ? "吊销中…" : "确认吊销"}
-            </button>
-          </div>
+          )}
         </div>
+
+        {!created ? (
+          <div className="space-y-5">
+            <div>
+              <label
+                htmlFor="apikey-name"
+                className="block font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-4"
+              >
+                {t("name")}
+              </label>
+              <p className="mt-1 text-[12px] leading-[1.55] text-text-3">
+                {t("key_name_hint")}
+              </p>
+              <input
+                id="apikey-name"
+                ref={nameInputRef}
+                type="text"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder={t("enter_key_name")}
+                autoComplete="off"
+                className={`mt-2 ${INPUT_CLS}`}
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="apikey-expires"
+                className="block font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-4"
+              >
+                {t("expiration_days")}
+              </label>
+              <p className="mt-1 text-[12px] leading-[1.55] text-text-3">
+                {t("zero_permanent_hint")}
+              </p>
+              <input
+                id="apikey-expires"
+                type="number"
+                min={0}
+                value={expiresDays}
+                onChange={(e) =>
+                  setExpiresDays(e.target.value === "" ? "" : Number(e.target.value))
+                }
+                className={`mt-2 ${INPUT_CLS} w-1/3`}
+              />
+            </div>
+
+            <div className="flex justify-end gap-2 border-t border-hairline-soft pt-4">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-[8px] px-3.5 py-2 text-[12.5px] text-text-3 transition-colors hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              >
+                {t("common:cancel")}
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleCreate()}
+                disabled={!canCreate || creating}
+                className={ACCENT_BTN_CLS}
+                style={ACCENT_BUTTON_STYLE}
+              >
+                {creating && (
+                  <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin" aria-hidden />
+                )}
+                {t("common:confirm")}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div
+              className="rounded-[10px] border px-4 py-3 text-[12px] leading-[1.55]"
+              style={{
+                borderColor: "var(--color-warm-ring)",
+                background: "var(--color-warm-tint)",
+              }}
+            >
+              <div className="mb-1.5 flex items-center gap-2 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-warm-bright">
+                <AlertTriangle className="h-3.5 w-3.5" />
+                {t("save_key_warning")}
+              </div>
+              <p className="text-text-2">{t("key_not_viewable_again")}</p>
+            </div>
+
+            <div className="relative">
+              <input
+                readOnly
+                type="text"
+                value={created.key}
+                aria-label={t("api_key_label")}
+                className="w-full rounded-[8px] border border-hairline bg-bg-grad-a/65 px-3 py-3 pr-12 font-mono text-[12.5px] tracking-[0.04em] text-accent-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              />
+              <CopyButton
+                text={created.key}
+                label={t("common:copy")}
+                copiedLabel={t("common:copied")}
+                className="absolute right-2 top-1/2 -translate-y-1/2"
+              />
+            </div>
+
+            <div className="flex justify-end pt-1">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-[8px] border border-hairline bg-bg-grad-a/55 px-5 py-2 text-[12.5px] text-text-2 transition-colors hover:border-hairline-strong hover:bg-bg-grad-a hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              >
+                {t("common:done")}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// ApiKeyRow — single key row
-// ---------------------------------------------------------------------------
-
-interface ApiKeyRowProps {
-  keyInfo: ApiKeyInfo;
-  onDelete: (keyInfo: ApiKeyInfo) => void;
-}
-
-function ApiKeyRow({ keyInfo, onDelete }: ApiKeyRowProps) {
-  const expired = useMemo(() => isExpired(keyInfo.expires_at), [keyInfo.expires_at]);
-
-  const handleDelete = useCallback(() => onDelete(keyInfo), [keyInfo, onDelete]);
-
-  return (
-    <tr className="group border-t border-gray-800/70 transition-colors hover:bg-gray-800/30">
-      {/* 名称 */}
-      <td className="py-3 pl-4 pr-3">
-        <div className="flex items-center gap-2">
-          <div className="min-w-0">
-            <div className="truncate text-sm font-medium text-gray-100">{keyInfo.name}</div>
-            <div className="mt-0.5 font-mono text-xs text-gray-500">{keyInfo.key_prefix}…</div>
-          </div>
-        </div>
-      </td>
-
-      {/* 创建时间 */}
-      <td className="hidden px-3 py-3 sm:table-cell">
-        <span className="text-xs text-gray-400">{formatDate(keyInfo.created_at)}</span>
-      </td>
-
-      {/* 过期时间 */}
-      <td className="hidden px-3 py-3 md:table-cell">
-        {keyInfo.expires_at ? (
-          <span
-            className={`text-xs ${expired ? "font-medium text-rose-400" : "text-gray-400"}`}
-          >
-            {expired ? "已过期 · " : ""}
-            {formatDate(keyInfo.expires_at)}
-          </span>
-        ) : (
-          <span className="text-xs text-gray-600">永不过期</span>
-        )}
-      </td>
-
-      {/* 最近使用 */}
-      <td className="hidden px-3 py-3 lg:table-cell">
-        <span className="text-xs text-gray-400">{formatDate(keyInfo.last_used_at)}</span>
-      </td>
-
-      {/* 操作 */}
-      <td className="py-3 pl-3 pr-4 text-right">
-        <button
-          type="button"
-          onClick={handleDelete}
-          className="inline-flex items-center gap-1 rounded-lg border border-transparent px-2 py-1 text-xs text-gray-500 transition-colors hover:border-rose-500/30 hover:bg-rose-500/8 hover:text-rose-400 focus-visible:ring-2 focus-visible:ring-indigo-500/60 focus-visible:outline-none"
-          aria-label={`吊销 ${keyInfo.name}`}
-        >
-          <Trash2 className="h-3.5 w-3.5" />
-          吊销
-        </button>
-      </td>
-    </tr>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// ApiKeysTab — main export
+// ApiKeysTab
 // ---------------------------------------------------------------------------
 
 export function ApiKeysTab() {
-  const [keys, setKeys] = useState<ApiKeyInfo[]>([]);
+  const { t, i18n } = useTranslation("dashboard");
+  const tRef = useRef(t);
+  // 同步最新 t 到 ref，供异步回调读取最新翻译函数
+  useEffect(() => {
+    tRef.current = t;
+  }, [t]);
+  const [keys, setApiKeys] = useState<ApiKeyInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
-  const [deleteTarget, setDeleteTarget] = useState<ApiKeyInfo | null>(null);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const fetchKeys = useCallback(async () => {
     try {
       const res = await API.listApiKeys();
-      setKeys(res);
+      setApiKeys(res);
     } catch (err) {
-      useAppStore.getState().pushToast(`加载 API Keys 失败: ${(err as Error).message}`, "error");
+      useAppStore
+        .getState()
+        .pushToast(tRef.current("load_failed", { message: errMsg(err) }), "error");
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    // mount 时异步拉取 API Key 列表后回写状态，属于受控的初始化加载
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void fetchKeys();
+  }, [fetchKeys]);
 
-  const handleCreated = useCallback((newKey: ApiKeyInfo) => {
-    setKeys((prev) => [newKey, ...prev]);
+  const handleDelete = useCallback(async (key: ApiKeyInfo) => {
+    if (!confirm(tRef.current("confirm_delete_key", { name: key.name }))) {
+      return;
+    }
+    setDeletingId(key.id);
+    try {
+      await API.deleteApiKey(key.id);
+      setApiKeys((prev) => prev.filter((k) => k.id !== key.id));
+      useAppStore.getState().pushToast(tRef.current("key_deleted_success"), "success");
+    } catch (err) {
+      useAppStore
+        .getState()
+        .pushToast(tRef.current("delete_failed", { message: errMsg(err) }), "error");
+    } finally {
+      setDeletingId(null);
+    }
   }, []);
-
-  const handleDeleted = useCallback((keyId: number) => {
-    setKeys((prev) => prev.filter((k) => k.id !== keyId));
-    setDeleteTarget(null);
-    useAppStore.getState().pushToast("API Key 已吊销", "success");
-  }, []);
-
-  const handleOpenCreate = useCallback(() => setShowCreate(true), []);
-  const handleCloseCreate = useCallback(() => setShowCreate(false), []);
-  const handleCloseDelete = useCallback(() => setDeleteTarget(null), []);
 
   return (
-    <>
-      {/* 操作栏 */}
-      <div className="mb-5 flex items-center justify-between">
+    <div className="space-y-6">
+      {/* Heading */}
+      <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-sm font-semibold text-gray-100">API Keys</h2>
-          <p className="mt-0.5 text-xs text-gray-500">
-            用于 OpenClaw 等外部服务通过 Bearer Token 访问 ArcReel API
+          <div className="font-mono text-[10px] font-bold uppercase tracking-[0.18em] text-accent-2">
+            Issued Tokens
+          </div>
+          <h3
+            className="font-editorial mt-1 flex items-center gap-2"
+            style={{
+              fontWeight: 400,
+              fontSize: 22,
+              lineHeight: 1.1,
+              letterSpacing: "-0.012em",
+              color: "var(--color-text)",
+            }}
+          >
+            <KeyRound className="h-4 w-4 text-accent-2" aria-hidden />
+            {t("api_key_mgmt")}
+          </h3>
+          <p className="mt-1.5 text-[12.5px] leading-[1.6] text-text-3">
+            {t("api_key_usage_desc")}
           </p>
         </div>
         <button
           type="button"
-          onClick={handleOpenCreate}
-          className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:ring-2 focus-visible:ring-indigo-500/60 focus-visible:outline-none"
+          onClick={() => setShowCreate(true)}
+          className={`${ACCENT_BTN_CLS} shrink-0`}
+          style={ACCENT_BUTTON_STYLE}
         >
-          <Plus className="h-4 w-4" />
-          新建 Key
+          <Plus className="h-3.5 w-3.5" aria-hidden />
+          {t("create_api_key")}
         </button>
       </div>
 
-      {/* 表格 */}
-      <div className="rounded-xl border border-gray-800 bg-gray-900/60 overflow-hidden">
-        {loading ? (
-          <div className="flex items-center justify-center gap-2 py-12 text-gray-500">
-            <Loader2 className="h-4 w-4 animate-spin text-indigo-400" />
-            <span className="text-sm">加载中…</span>
-          </div>
-        ) : keys.length === 0 ? (
-          <div className="flex flex-col items-center justify-center gap-2 py-14 text-gray-600">
-            <KeyRound className="h-8 w-8 opacity-40" />
-            <p className="text-sm">还没有 API Key</p>
-            <p className="text-xs">点击「新建 Key」创建第一个</p>
-          </div>
-        ) : (
-          <table className="w-full text-left">
-            <thead>
-              <tr className="border-b border-gray-800">
-                <th className="py-2.5 pl-4 pr-3 text-xs font-medium text-gray-500">名称 / 前缀</th>
-                <th className="hidden px-3 py-2.5 text-xs font-medium text-gray-500 sm:table-cell">
-                  创建时间
+      {/* Table */}
+      <div
+        className="overflow-hidden rounded-[10px] border border-hairline"
+        style={CARD_STYLE}
+      >
+        <table className="w-full border-collapse text-left text-[12.5px]">
+          <thead>
+            <tr className="border-b border-hairline-soft">
+              {[
+                t("name"),
+                t("key_prefix"),
+                t("created_at"),
+                t("expires_at"),
+                t("last_used"),
+              ].map((label) => (
+                <th
+                  key={label}
+                  className="px-4 py-3 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-4"
+                >
+                  {label}
                 </th>
-                <th className="hidden px-3 py-2.5 text-xs font-medium text-gray-500 md:table-cell">
-                  过期时间
-                </th>
-                <th className="hidden px-3 py-2.5 text-xs font-medium text-gray-500 lg:table-cell">
-                  最近使用
-                </th>
-                <th className="py-2.5 pl-3 pr-4 text-right text-xs font-medium text-gray-500">
-                  操作
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {keys.map((k) => (
-                <ApiKeyRow key={k.id} keyInfo={k} onDelete={setDeleteTarget} />
               ))}
-            </tbody>
-          </table>
-        )}
+              <th className="px-4 py-3 text-right font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-4">
+                {t("actions")}
+              </th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[var(--color-hairline-soft)]">
+            {loading ? (
+              <tr>
+                <td colSpan={6} className="px-4 py-12 text-center">
+                  <div className="flex items-center justify-center gap-2 text-text-3">
+                    <Loader2
+                      className="h-3.5 w-3.5 motion-safe:animate-spin text-accent-2"
+                      aria-hidden
+                    />
+                    <span className="font-mono text-[10.5px] uppercase tracking-[0.14em]">
+                      {t("common:loading")}
+                    </span>
+                  </div>
+                </td>
+              </tr>
+            ) : keys.length === 0 ? (
+              <tr>
+                <td colSpan={6} className="px-4 py-12 text-center">
+                  <div className="mx-auto flex max-w-[240px] flex-col items-center gap-3">
+                    <div className="rounded-full border border-hairline-soft bg-bg-grad-a/45 p-3">
+                      <KeyRound className="h-5 w-5 text-text-4" aria-hidden />
+                    </div>
+                    <div className="space-y-1.5">
+                      <p className="text-[12.5px] text-text-3">{t("no_api_keys")}</p>
+                      <button
+                        onClick={() => setShowCreate(true)}
+                        className="font-mono text-[10.5px] font-bold uppercase tracking-[0.14em] text-accent-2 transition-colors hover:text-accent"
+                      >
+                        {t("create_one_now")}
+                      </button>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+            ) : (
+              keys.map((key) => {
+                const expired = isExpired(key.expires_at);
+                return (
+                  <tr
+                    key={key.id}
+                    className="group transition-colors hover:bg-bg-grad-a/35"
+                  >
+                    <td className="px-4 py-4 font-medium text-text">{key.name}</td>
+                    <td className="px-4 py-4 font-mono text-text-3">
+                      {key.key_prefix}****
+                    </td>
+                    <td className="px-4 py-4 font-mono tabular-nums text-text-2">
+                      {formatDate(key.created_at, i18n.language, FULL_DATE_OPTS)}
+                    </td>
+                    <td className="px-4 py-4">
+                      {!key.expires_at ? (
+                        <span className="font-mono text-[10.5px] uppercase tracking-[0.14em] text-text-4">
+                          {t("permanent")}
+                        </span>
+                      ) : expired ? (
+                        <span
+                          className="inline-flex rounded-full px-2.5 py-0.5 font-mono text-[10px] font-bold uppercase tracking-[0.14em]"
+                          style={{
+                            background: "var(--color-warm-tint)",
+                            color: "var(--color-warm-bright)",
+                            border: "1px solid var(--color-warm-ring)",
+                          }}
+                        >
+                          {t("expired")}
+                        </span>
+                      ) : (
+                        <span className="font-mono tabular-nums text-text-2">
+                          {formatDate(key.expires_at, i18n.language, FULL_DATE_OPTS)}
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-4 py-4 font-mono tabular-nums text-text-3">
+                      {formatDate(key.last_used_at, i18n.language, FULL_DATE_OPTS)}
+                    </td>
+                    <td className="px-4 py-4 text-right">
+                      <button
+                        type="button"
+                        onClick={() => void handleDelete(key)}
+                        disabled={deletingId === key.id}
+                        className="rounded-[6px] p-2 text-text-3 transition-colors hover:bg-warm-tint hover:text-warm-bright focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                        title={t("common:delete")}
+                      >
+                        {deletingId === key.id ? (
+                          <Loader2
+                            className="h-3.5 w-3.5 motion-safe:animate-spin"
+                            aria-hidden
+                          />
+                        ) : (
+                          <Trash2 className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
       </div>
 
-      {/* 说明 */}
-      <p className="mt-3 text-xs text-gray-600">
-        在请求头中携带：
-        <code className="mx-1 rounded bg-gray-800 px-1.5 py-0.5 font-mono text-gray-400">
-          Authorization: Bearer arc-xxxxxxxx…
-        </code>
-      </p>
-
-      {/* 弹窗 */}
       {showCreate && (
-        <CreateModal onClose={handleCloseCreate} onCreated={handleCreated} />
-      )}
-      {deleteTarget !== null && (
-        <DeleteModal
-          keyInfo={deleteTarget}
-          onClose={handleCloseDelete}
-          onDeleted={handleDeleted}
+        <CreateModal
+          onClose={() => setShowCreate(false)}
+          onCreated={(k) => setApiKeys((prev) => [k, ...prev])}
         />
       )}
-    </>
+    </div>
   );
 }

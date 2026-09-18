@@ -13,16 +13,60 @@ interface Toast {
   tone: "info" | "success" | "error" | "warning";
 }
 
-interface ToastOptions {
-  target?: WorkspaceNotificationTarget | null;
-}
-
 interface FocusedContext {
-  type: "character" | "clue" | "segment";
+  type: "character" | "scene" | "prop" | "segment";
   id: string;
 }
 
 const ALL_ENTITIES_REVISION_KEY = "__all__";
+
+export const ASSISTANT_PANEL_DEFAULT_WIDTH = 505;
+export const ASSISTANT_PANEL_MIN_WIDTH = 360;
+export const ASSISTANT_PANEL_MAX_WIDTH = 720;
+const ASSISTANT_PANEL_WIDTH_STORAGE_KEY = "arcreel_assistant_panel_width";
+const ASSISTANT_PANEL_OPEN_STORAGE_KEY = "arcreel_assistant_panel_open";
+
+export function clampAssistantPanelWidth(value: number): number {
+  if (!Number.isFinite(value)) return ASSISTANT_PANEL_DEFAULT_WIDTH;
+  return Math.min(
+    ASSISTANT_PANEL_MAX_WIDTH,
+    Math.max(ASSISTANT_PANEL_MIN_WIDTH, Math.round(value)),
+  );
+}
+
+function readPersistedAssistantPanelWidth(): number {
+  if (typeof window === "undefined") return ASSISTANT_PANEL_DEFAULT_WIDTH;
+  try {
+    const raw = window.localStorage.getItem(ASSISTANT_PANEL_WIDTH_STORAGE_KEY);
+    if (!raw) return ASSISTANT_PANEL_DEFAULT_WIDTH;
+    const parsed = parseInt(raw, 10);
+    if (Number.isNaN(parsed)) return ASSISTANT_PANEL_DEFAULT_WIDTH;
+    return clampAssistantPanelWidth(parsed);
+  } catch {
+    return ASSISTANT_PANEL_DEFAULT_WIDTH;
+  }
+}
+
+function readPersistedAssistantPanelOpen(): boolean | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(ASSISTANT_PANEL_OPEN_STORAGE_KEY);
+    return raw === "true" ? true : raw === "false" ? false : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistAssistantPanelOpen(open: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(ASSISTANT_PANEL_OPEN_STORAGE_KEY, String(open));
+  } catch {
+    // localStorage 不可用时仅保留内存值
+  }
+}
+
+const initialAssistantPanelOpen = readPersistedAssistantPanelOpen();
 
 interface AppState {
   // Context focus (design doc "Context-Aware" feature)
@@ -38,7 +82,12 @@ interface AppState {
 
   // Toast
   toast: Toast | null;
-  pushToast: (text: string, tone?: Toast["tone"], options?: ToastOptions) => void;
+  pushToast: (text: string, tone?: Toast["tone"]) => void;
+  pushNotification: (
+    text: string,
+    tone?: Toast["tone"],
+    options?: { target?: WorkspaceNotificationTarget | null },
+  ) => void;
   clearToast: () => void;
   workspaceNotifications: WorkspaceNotification[];
   pushWorkspaceNotification: (input: WorkspaceNotificationInput) => void;
@@ -49,14 +98,29 @@ interface AppState {
 
   // Panels
   assistantPanelOpen: boolean;
+  assistantPanelInitialized: boolean;
+  initializeAssistantPanel: (openByDefault: boolean) => void;
   toggleAssistantPanel: () => void;
   setAssistantPanelOpen: (open: boolean) => void;
-  taskHudOpen: boolean;
-  setTaskHudOpen: (open: boolean) => void;
+  assistantPanelWidth: number;
+  setAssistantPanelWidth: (width: number) => void;
+  persistAssistantPanelWidth: () => void;
+  /** 顶栏用量悬浮层的开合；画布侧也从这里打开面板。 */
+  usagePanelOpen: boolean;
+  setUsagePanelOpen: (open: boolean) => void;
 
   // Source files invalidation signal
   sourceFilesVersion: number;
   invalidateSourceFiles: () => void;
+
+  // Grid list invalidation signal (incremented on grid_ready SSE events)
+  gridsRevision: number;
+  invalidateGrids: () => void;
+
+  // 视频单元失效信号：参考生视频任务终态经项目事件 SSE 推来时自增，参考生
+  // 视频画布据此重拉单元，生成完成后无需手动刷新即可看到成片。
+  referenceVideoUnitsRevision: number;
+  invalidateReferenceVideoUnits: () => void;
 
   // Entity-scoped invalidation signal for cache-busted asset URLs
   entityRevisions: Record<string, number>;
@@ -65,6 +129,33 @@ interface AppState {
   getEntityRevision: (key: string) => number;
 }
 
+/**
+ * 通知系统分工规则：
+ *
+ * - pushToast(text, tone)
+ *     用于：用户主动操作的即时反馈。
+ *     典型：表单保存/校验、导入/删除/切换/上传成功、scroll target 未找到、
+ *          后台任务提交成功回执（task_submitted）、入队请求同步失败
+ *          （用户在场可立即重试，不进 drawer）、轻量错误提示。
+ *
+ * - pushWorkspaceNotification({ text, tone, target })
+ *     用于：后台异步产生的事件，用户可能不在当前页。
+ *     典型：SSE 单条事件留痕（如 agent_update_scene）。
+ *
+ * - pushNotification(text, tone, options?)
+ *     用于：用户需要后续回看的重要结果。
+ *     典型：后台任务（worker）失败——storyboard/video/character/scene/prop/grid/
+ *          参考生视频转入 failed，由 useTaskFailureNotifications 统一监听并附
+ *          可点击回跳 target；剪映/ZIP 导出失败、项目 regenerate 失败；
+ *          SSE grouped_notification。注意：入队请求同步失败属即时反馈，用 toast。
+ *
+ * 判断口诀：
+ *   1. 用户现在不在场 → 需要持久
+ *   2. 后台任务"失败"需要留痕排查 → 需要持久
+ *   3. 其余 → 仅 toast
+ *
+ * pushToast 不接受 { persist: true } 之类逃生门，强制调用点三选一，意图显式。
+ */
 const MAX_WORKSPACE_NOTIFICATIONS = 40;
 
 function buildWorkspaceNotification(
@@ -109,15 +200,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ assistantToolActivitySuppressed: suppressed }),
 
   toast: null,
-  pushToast: (text, tone = "info", options) =>
+  pushToast: (text, tone = "info") =>
+    set({
+      toast: { id: `${Date.now()}-${Math.random()}`, text, tone },
+    }),
+  pushNotification: (text, tone = "info", options) =>
     set((s) => ({
       toast: { id: `${Date.now()}-${Math.random()}`, text, tone },
       workspaceNotifications: [
-        buildWorkspaceNotification({
-          text,
-          tone,
-          target: options?.target ?? null,
-        }),
+        buildWorkspaceNotification({ text, tone, target: options?.target ?? null }),
         ...s.workspaceNotifications,
       ].slice(0, MAX_WORKSPACE_NOTIFICATIONS),
     })),
@@ -148,15 +239,51 @@ export const useAppStore = create<AppState>((set, get) => ({
     })),
   clearWorkspaceNotifications: () => set({ workspaceNotifications: [] }),
 
-  assistantPanelOpen: true,
+  assistantPanelOpen: initialAssistantPanelOpen ?? false,
+  assistantPanelInitialized: initialAssistantPanelOpen !== null,
+  initializeAssistantPanel: (openByDefault) =>
+    set((s) => {
+      if (s.assistantPanelInitialized) return s;
+      return {
+        assistantPanelOpen: readPersistedAssistantPanelOpen() ?? openByDefault,
+        assistantPanelInitialized: true,
+      };
+    }),
   toggleAssistantPanel: () =>
-    set((s) => ({ assistantPanelOpen: !s.assistantPanelOpen })),
-  setAssistantPanelOpen: (open) => set({ assistantPanelOpen: open }),
-  taskHudOpen: false,
-  setTaskHudOpen: (open) => set({ taskHudOpen: open }),
+    set((s) => {
+      const open = !s.assistantPanelOpen;
+      persistAssistantPanelOpen(open);
+      return { assistantPanelOpen: open, assistantPanelInitialized: true };
+    }),
+  setAssistantPanelOpen: (open) =>
+    set({ assistantPanelOpen: open, assistantPanelInitialized: true }),
+  assistantPanelWidth: readPersistedAssistantPanelWidth(),
+  setAssistantPanelWidth: (width) =>
+    set({ assistantPanelWidth: clampAssistantPanelWidth(width) }),
+  persistAssistantPanelWidth: () => {
+    if (typeof window === "undefined") return;
+    const width = clampAssistantPanelWidth(get().assistantPanelWidth);
+    try {
+      window.localStorage.setItem(
+        ASSISTANT_PANEL_WIDTH_STORAGE_KEY,
+        String(width),
+      );
+    } catch {
+      // localStorage 不可用（隐私模式 / quota exceeded）静默失败，内存值仍生效
+    }
+  },
+  usagePanelOpen: false,
+  setUsagePanelOpen: (open) => set({ usagePanelOpen: open }),
 
   sourceFilesVersion: 0,
   invalidateSourceFiles: () => set((s) => ({ sourceFilesVersion: s.sourceFilesVersion + 1 })),
+
+  gridsRevision: 0,
+  invalidateGrids: () => set((s) => ({ gridsRevision: s.gridsRevision + 1 })),
+
+  referenceVideoUnitsRevision: 0,
+  invalidateReferenceVideoUnits: () =>
+    set((s) => ({ referenceVideoUnitsRevision: s.referenceVideoUnitsRevision + 1 })),
 
   entityRevisions: {},
   invalidateEntities: (keys) =>

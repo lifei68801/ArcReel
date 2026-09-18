@@ -1,6 +1,5 @@
-import { useState } from "react";
-import { cn } from "./utils";
-import { StreamMarkdown } from "../StreamMarkdown";
+import { useId, useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { ContentBlock, TodoItem } from "@/types";
 
 // ---------------------------------------------------------------------------
@@ -31,25 +30,19 @@ function getToolSummary(name: string, input: Record<string, unknown> | undefined
       return (input.query as string) || "";
     case "WebFetch":
       return (input.url as string) || "";
+    case "AskUserQuestion": {
+      const questions = Array.isArray(input.questions) ? (input.questions as Array<Record<string, unknown>>) : [];
+      const text = questions
+        .map((q) => (typeof q.question === "string" ? q.question : ""))
+        .filter(Boolean)
+        .join(" / ");
+      return text.length > 60 ? text.slice(0, 60) + "..." : text;
+    }
     default: {
       const str = JSON.stringify(input);
       return str.length > 50 ? str.slice(0, 50) + "..." : str;
     }
   }
-}
-
-/**
- * Extract the skill name and arguments from a Skill tool_use input.
- */
-function extractSkillInfo(input: Record<string, unknown> | undefined): {
-  skillName: string;
-  args: string;
-} {
-  if (!input) return { skillName: "unknown", args: "" };
-  return {
-    skillName: (input.skill as string) || (input.name as string) || "unknown",
-    args: (input.args as string) || "",
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -62,21 +55,31 @@ interface ToolCallWithResultProps {
 
 /**
  * ToolCallWithResult -- unified display of a tool_use block with its
- * optional result and skill_content.
+ * optional result: collapsible header showing tool name + summary,
+ * expandable input / result sections.
  *
- * Regular tools:  collapsible header showing tool name + summary, expandable
- *                 input / result sections.
- * Skill tool:     purple-accented header with `/skill-name`, optional skill
- *                 content rendered as markdown.
+ * Skill 与 Agent/Task tool_use 不经过本组件（分别由 SkillChip 与
+ * SubagentCard 渲染，见 ContentBlockRenderer 分发）。
  */
 export function ToolCallWithResult({ block }: ToolCallWithResultProps) {
+  const { t } = useTranslation("dashboard");
   const [isExpanded, setIsExpanded] = useState(false);
+  const detailsId = useId();
 
   const toolName = block.name || "Tool";
-  const isSkill = toolName === "Skill";
   const isTodoWrite = toolName === "TodoWrite";
+
+  // ArcReel in-process MCP tool 显示名：从 mcp__arcreel__<id> 中提取 id，
+  // 查 dashboard:tool_name_<id>（单一真相源 = backend ARCREEL_MCP_TOOL_IDS）。
+  // AskUserQuestion 显示为本地化「提问」标签；其余工具（Bash / TodoWrite /
+  // Skill / ...）保留原名。
+  const mcpMatch = /^mcp__arcreel__([a-z0-9_]+)$/.exec(toolName);
+  const displayName = mcpMatch
+    ? t(`tool_name_${mcpMatch[1]}`, { defaultValue: toolName })
+    : toolName === "AskUserQuestion"
+      ? t("tool_call_question_label")
+      : toolName;
   const hasResult = block.result !== undefined;
-  const hasSkillContent = !!block.skill_content;
   const isError = block.is_error;
 
   // -- TodoWrite compact display -----------------------------------------------
@@ -85,59 +88,74 @@ export function ToolCallWithResult({ block }: ToolCallWithResultProps) {
   }
 
   // -- colours ---------------------------------------------------------------
-  const borderClass = isError
-    ? "border-red-500/30"
-    : isSkill
-      ? "border-purple-400/30"
-      : "border-white/15";
+  const containerStyle: React.CSSProperties = isError
+    ? {
+        border: "1px solid oklch(0.70 0.18 25 / 0.3)",
+        background: "oklch(0.70 0.18 25 / 0.06)",
+      }
+    : {
+        border: "1px solid var(--color-hairline-soft)",
+        background: "oklch(0.21 0.012 265 / 0.5)",
+      };
 
-  const bgClass = isError
-    ? "bg-red-500/5"
-    : isSkill
-      ? "bg-purple-500/10"
-      : "bg-ink-800/50";
-
-  const labelColor = isError
-    ? "text-red-400"
-    : isSkill
-      ? "text-purple-400"
-      : "text-amber-400";
+  const labelColor = isError ? "var(--color-danger)" : "var(--color-warn)";
 
   // -- status indicator ------------------------------------------------------
   const statusIcon = hasResult ? (isError ? "\u2717" : "\u2713") : "\u2026";
 
   const statusColor = hasResult
     ? isError
-      ? "text-red-400"
-      : "text-emerald-400"
-    : "text-slate-500";
+      ? "var(--color-danger)"
+      : "var(--color-good)"
+    : "var(--color-text-4)";
 
   // -- summary text ----------------------------------------------------------
-  const summary = isSkill
-    ? `/${extractSkillInfo(block.input).skillName}`
-    : getToolSummary(toolName, block.input);
+  const summary = getToolSummary(toolName, block.input);
 
   return (
-    <div className={cn("my-1.5 rounded-lg border overflow-hidden min-w-0", borderClass, bgClass)}>
+    <div
+      className="my-1.5 min-w-0 overflow-hidden rounded-lg"
+      style={containerStyle}
+    >
       {/* Header button */}
       <button
         type="button"
         onClick={() => setIsExpanded(!isExpanded)}
-        className="w-full px-2.5 py-1.5 flex items-center justify-between text-left hover:bg-white/5 transition-colors"
+        aria-expanded={isExpanded}
+        aria-controls={detailsId}
+        className="flex w-full items-center justify-between px-2.5 py-1.5 text-left transition-colors"
+        onMouseEnter={(e) => {
+          e.currentTarget.style.background = "oklch(1 0 0 / 0.04)";
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.background = "transparent";
+        }}
       >
-        <div className="flex items-center gap-1.5 min-w-0 flex-1 overflow-hidden">
-          <span className={cn("text-[10px] font-semibold uppercase shrink-0", labelColor)}>
-            {toolName}
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+          <span
+            className="shrink-0 text-[10px] font-semibold uppercase tracking-wide"
+            style={{ color: labelColor }}
+          >
+            {displayName}
           </span>
-          <span className="text-[11px] text-slate-300 truncate">
+          <span
+            className="num truncate text-[11px]"
+            style={{ color: "var(--color-text-2)" }}
+          >
             {summary}
           </span>
         </div>
-        <div className="flex items-center gap-1.5 shrink-0 ml-1.5">
-          <span className={cn("text-xs font-medium", statusColor)}>
+        <div className="ml-1.5 flex shrink-0 items-center gap-1.5">
+          <span
+            className="text-xs font-medium"
+            style={{ color: statusColor }}
+          >
             {statusIcon}
           </span>
-          <span className="text-[10px] text-slate-500">
+          <span
+            className="text-[10px]"
+            style={{ color: "var(--color-text-4)" }}
+          >
             {isExpanded ? "\u25BC" : "\u25B6"}
           </span>
         </div>
@@ -145,48 +163,54 @@ export function ToolCallWithResult({ block }: ToolCallWithResultProps) {
 
       {/* Expandable detail sections */}
       {isExpanded && (
-        <div className="border-t border-white/10">
+        <div
+          id={detailsId}
+          style={{ borderTop: "1px solid var(--color-hairline-soft)" }}
+        >
           {/* Tool Input */}
-          <div className="px-2.5 py-2 bg-ink-900/30">
-            <div className="text-[10px] uppercase tracking-wide text-slate-500 mb-1">
-              输入参数
+          <div
+            className="px-2.5 py-2"
+            style={{ background: "oklch(0.16 0.010 265 / 0.5)" }}
+          >
+            <div
+              className="mb-1 text-[10px] uppercase tracking-wide"
+              style={{ color: "var(--color-text-4)" }}
+            >
+              {t("tool_call_input_label")}
             </div>
-            <pre className="text-[11px] text-slate-300 whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
+            <pre
+              className="num max-h-32 overflow-y-auto whitespace-pre-wrap break-all text-[11px]"
+              style={{ color: "var(--color-text-2)" }}
+            >
               {JSON.stringify(block.input, null, 2)}
             </pre>
           </div>
 
-          {/* Skill Content (only for Skill tool) */}
-          {hasSkillContent && (
-            <div className="px-2.5 py-2 border-t border-purple-400/10 bg-purple-900/10">
-              <div className="text-[10px] uppercase tracking-wide text-purple-400 mb-1">
-                Skill 内容
-              </div>
-              <div className="max-h-48 overflow-y-auto text-xs overflow-hidden">
-                <StreamMarkdown content={block.skill_content!} />
-              </div>
-            </div>
-          )}
-
           {/* Tool Result */}
           {hasResult && (
             <div
-              className={cn(
-                "px-2.5 py-2 border-t",
-                isError
-                  ? "border-red-400/20 bg-red-900/10"
-                  : "border-white/10 bg-ink-900/50",
-              )}
+              className="px-2.5 py-2"
+              style={{
+                borderTop: isError
+                  ? "1px solid oklch(0.70 0.18 25 / 0.25)"
+                  : "1px solid var(--color-hairline-soft)",
+                background: isError
+                  ? "oklch(0.70 0.18 25 / 0.08)"
+                  : "oklch(0.16 0.010 265 / 0.5)",
+              }}
             >
               <div
-                className={cn(
-                  "text-[10px] uppercase tracking-wide mb-1",
-                  isError ? "text-red-400" : "text-slate-500",
-                )}
+                className="mb-1 text-[10px] uppercase tracking-wide"
+                style={{
+                  color: isError ? "var(--color-danger)" : "var(--color-text-4)",
+                }}
               >
-                {isError ? "执行失败" : "执行结果"}
+                {isError ? t("tool_call_error_label") : t("tool_call_result_label")}
               </div>
-              <pre className="text-[11px] text-slate-300 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
+              <pre
+                className="num max-h-48 overflow-y-auto whitespace-pre-wrap break-all text-[11px]"
+                style={{ color: "var(--color-text-2)" }}
+              >
                 {typeof block.result === "string"
                   ? block.result
                   : JSON.stringify(block.result, null, 2)}
@@ -204,26 +228,44 @@ export function ToolCallWithResult({ block }: ToolCallWithResultProps) {
 // ---------------------------------------------------------------------------
 
 function TodoWriteCompact({ block }: Readonly<{ block: ContentBlock }>) {
-  const input = block.input as Record<string, unknown> | undefined;
-  const todos: TodoItem[] = Array.isArray(input?.todos) ? input.todos : [];
+  const { t } = useTranslation("dashboard");
+  const input = block.input;
+  const todos: TodoItem[] = Array.isArray(input?.todos) ? (input.todos as TodoItem[]) : [];
   const total = todos.length;
-  const completed = todos.filter((t) => t.status === "completed").length;
+  const completed = todos.filter((td) => td.status === "completed").length;
   const hasResult = block.result !== undefined;
   const statusIcon = hasResult ? "\u2713" : "\u2026";
-  const statusColor = hasResult ? "text-emerald-400" : "text-slate-500";
+  const statusColor = hasResult ? "var(--color-good)" : "var(--color-text-4)";
 
   return (
-    <div className="my-1.5 rounded-lg border border-white/15 bg-ink-800/50 overflow-hidden min-w-0">
-      <div className="px-2.5 py-1.5 flex items-center justify-between">
-        <div className="flex items-center gap-1.5 min-w-0 flex-1 overflow-hidden">
-          <span className="text-[10px] font-semibold uppercase shrink-0 text-slate-500">
+    <div
+      className="my-1.5 min-w-0 overflow-hidden rounded-lg"
+      style={{
+        border: "1px solid var(--color-hairline-soft)",
+        background: "oklch(0.21 0.012 265 / 0.5)",
+      }}
+    >
+      <div className="flex items-center justify-between px-2.5 py-1.5">
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+          <span
+            className="shrink-0 text-[10px] font-semibold uppercase tracking-wide"
+            style={{ color: "var(--color-text-4)" }}
+          >
             TodoWrite
           </span>
-          <span className="text-[11px] text-slate-300 truncate">
-            {total > 0 ? `任务清单 ${completed}/${total} 完成` : "任务清单已更新"}
+          <span
+            className="truncate text-[11px]"
+            style={{ color: "var(--color-text-2)" }}
+          >
+            {total > 0
+              ? t("tool_call_todo_summary", { completed, total })
+              : t("tool_call_todo_updated")}
           </span>
         </div>
-        <span className={cn("text-xs font-medium shrink-0 ml-1.5", statusColor)}>
+        <span
+          className="ml-1.5 shrink-0 text-xs font-medium"
+          style={{ color: statusColor }}
+        >
           {statusIcon}
         </span>
       </div>

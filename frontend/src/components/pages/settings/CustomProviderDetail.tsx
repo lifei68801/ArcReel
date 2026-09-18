@@ -1,31 +1,63 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, type CSSProperties } from "react";
 import { Loader2, Pencil, Trash2, CheckCircle2, XCircle } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { API } from "@/api";
 import { useAppStore } from "@/stores/app-store";
+import { useCapabilitiesStore } from "@/stores/capabilities-store";
+import { errMsg } from "@/utils/async";
 import type { CustomProviderInfo } from "@/types";
+import { useEndpointCatalogStore } from "@/stores/endpoint-catalog-store";
+import { formatDurationsLabel } from "@/utils/duration_format";
+import { formatDate } from "@/utils/date-format";
+import { ACCENT_BTN_CLS, ACCENT_BUTTON_STYLE, CARD_STYLE, GHOST_BTN_CLS } from "@/components/ui/darkroom-tokens";
 import { CustomProviderForm } from "./CustomProviderForm";
+import { isComfyuiProtocol } from "./customProviderHelpers";
 
-// ---------------------------------------------------------------------------
-// Media type label
-// ---------------------------------------------------------------------------
-
-const MEDIA_LABELS: Record<string, string> = {
-  text: "文本",
-  image: "图片",
-  video: "视频",
+//: 模型发现协议 → 展示名。协议是专有名词，不进 i18n；名录外的取值原样显示大写形态。
+const PROTOCOL_LABELS: Record<string, string> = {
+  openai: "OpenAI",
+  google: "Google",
+  comfyui: "ComfyUI",
 };
 
-// ---------------------------------------------------------------------------
-// Component
-// ---------------------------------------------------------------------------
+function protocolLabel(format: string): string {
+  return PROTOCOL_LABELS[format] ?? format;
+}
+
+const MEDIA_LABELS: Record<string, string> = {
+  text: "media_type_text",
+  image: "media_type_image",
+  video: "media_type_video",
+  audio: "media_type_audio",
+};
+
+const READY_BADGE_STYLE: CSSProperties = {
+  background: "oklch(0.30 0.10 155 / 0.18)",
+  color: "var(--color-good)",
+  border: "1px solid oklch(0.45 0.10 155 / 0.40)",
+  boxShadow: "0 0 14px -6px oklch(0.55 0.10 155 / 0.50)",
+};
+
+const UNCONFIGURED_BADGE_STYLE: CSSProperties = {
+  background: "var(--color-bg-grad-a)",
+  color: "var(--color-text-3)",
+  border: "1px solid var(--color-hairline)",
+};
 
 interface CustomProviderDetailProps {
   providerId: number;
+  initialModelId?: string;
   onDeleted: () => void;
   onSaved: () => void;
 }
 
-export function CustomProviderDetail({ providerId, onDeleted, onSaved }: CustomProviderDetailProps) {
+export function CustomProviderDetail({ providerId, initialModelId, onDeleted, onSaved }: CustomProviderDetailProps) {
+  const { t, i18n } = useTranslation("dashboard");
+  const endpointToMediaType = useEndpointCatalogStore((s) => s.endpointToMediaType);
+  const fetchEndpointCatalog = useEndpointCatalogStore((s) => s.fetch);
+  useEffect(() => {
+    void fetchEndpointCatalog();
+  }, [fetchEndpointCatalog]);
   const [provider, setProvider] = useState<CustomProviderInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(false);
@@ -46,38 +78,42 @@ export function CustomProviderDetail({ providerId, onDeleted, onSaved }: CustomP
   }, [providerId]);
 
   useEffect(() => {
-    setEditing(false);
+    // providerId 切换时重置编辑/删除/测试态并重新拉取（动作驱动重置）
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setEditing(Boolean(initialModelId));
     setConfirmDelete(false);
     setTestResult(null);
     void fetchProvider();
-  }, [fetchProvider]);
+  }, [fetchProvider, initialModelId]);
 
   const handleDelete = useCallback(async () => {
     setDeleting(true);
     try {
       await API.deleteCustomProvider(providerId);
+      // 该供应商上的模型与能力覆盖随之消失，项目会退回解析别的模型；这同样不落任何项目字段。
+      useCapabilitiesStore.getState().invalidate();
       onDeleted();
     } catch (e) {
-      showError(e instanceof Error ? e.message : "删除失败");
+      showError(t("delete_failed", { message: errMsg(e) }));
     } finally {
       setDeleting(false);
       setConfirmDelete(false);
     }
-  }, [providerId, onDeleted]);
+  }, [providerId, onDeleted, showError, t]);
 
   const handleTest = useCallback(async () => {
     if (!provider) return;
     setTesting(true);
     setTestResult(null);
     try {
-      const res = await API.testCustomConnectionById(provider.id);
+      const res = await API.checkCustomConnectivityById(provider.id);
       setTestResult(res);
     } catch (e) {
-      setTestResult({ success: false, message: e instanceof Error ? e.message : "连接测试失败" });
+      setTestResult({ success: false, message: errMsg(e, t("connectivity_check_failed")) });
     } finally {
       setTesting(false);
     }
-  }, [provider]);
+  }, [provider, t]);
 
   const handleFormSaved = useCallback(() => {
     setEditing(false);
@@ -87,159 +123,222 @@ export function CustomProviderDetail({ providerId, onDeleted, onSaved }: CustomP
 
   if (loading || !provider) {
     return (
-      <div className="flex items-center gap-2 text-sm text-gray-500">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        加载中…
+      <div className="flex items-center gap-2 px-1 py-12 text-text-3">
+        <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin text-accent-2" aria-hidden />
+        <span className="font-mono text-[11px] uppercase tracking-[0.14em]">
+          {t("common:loading")}
+        </span>
       </div>
     );
   }
 
-  // --- Edit mode ---
   if (editing) {
     return (
       <CustomProviderForm
         existing={provider}
+        focusModelId={initialModelId}
         onSaved={handleFormSaved}
         onCancel={() => setEditing(false)}
       />
     );
   }
 
-  // --- Read mode ---
   const ready = provider.base_url && provider.api_key_masked;
 
   return (
-    <div className="flex h-full flex-col">
-      {/* Scrollable content */}
-      <div className="flex-1 overflow-y-auto p-6">
-      <div className="max-w-xl">
-      {/* Header */}
-      <div className="mb-6 flex items-start gap-3">
-        <span className="mt-0.5 inline-flex h-7 w-7 items-center justify-center rounded bg-gray-700 text-sm font-bold uppercase text-gray-300">
-          {provider.display_name?.[0] ?? "?"}
-        </span>
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <h3 className="text-lg font-semibold text-gray-100">{provider.display_name}</h3>
+    <div>
+      <div className="p-6 pb-24">
+        <div className="max-w-2xl space-y-6">
+          {/* Header */}
+          <div className="flex items-start gap-3">
+            {/* 自定义 provider 恒用字母徽章，不按名字猜品牌（理由见 CustomProviderSection） */}
             <span
-              className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                ready
-                  ? "border border-green-800/50 bg-green-900/30 text-green-400"
-                  : "border border-gray-700 bg-gray-800 text-gray-400"
-              }`}
+              className="mt-0.5 inline-flex h-7 w-7 items-center justify-center rounded-[6px] font-mono text-[11px] font-bold uppercase text-text-2"
+              style={{
+                background: "var(--color-bg-grad-a)",
+                border: "1px solid var(--color-hairline-strong)",
+              }}
             >
-              {ready ? "已连接" : "未配置"}
+              {Array.from(provider.display_name)[0] ?? "?"}
             </span>
-          </div>
-          <p className="mt-1 text-sm text-gray-500">
-            {provider.api_format === "openai" ? "OpenAI" : "Google"} &middot; {provider.base_url}
-          </p>
-        </div>
-      </div>
-
-      {/* Info card */}
-      <div className="mb-5 rounded-xl border border-gray-800 bg-gray-950/40 p-4">
-        <div className="space-y-2 text-sm">
-          <div className="flex justify-between">
-            <span className="text-gray-500">API 格式</span>
-            <span className="text-gray-300">
-              {provider.api_format === "openai" ? "OpenAI" : "Google"}
-            </span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-gray-500">Base URL</span>
-            <span className="truncate pl-4 text-gray-300">{provider.base_url}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-gray-500">API Key</span>
-            <span className="text-gray-300">{provider.api_key_masked || "未设置"}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-gray-500">创建时间</span>
-            <span className="text-gray-300">
-              {new Date(provider.created_at).toLocaleDateString("zh-CN")}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* Model list */}
-      {provider.models.length > 0 && (
-        <div className="mb-5">
-          <div className="mb-2 text-sm text-gray-400">模型列表</div>
-          <div className="space-y-1.5">
-            {provider.models.map((m) => (
-              <div
-                key={m.id}
-                className={`flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-950/40 px-3 py-2 text-sm ${
-                  m.is_enabled ? "text-gray-200" : "text-gray-500 opacity-60"
-                }`}
-              >
-                <span className="min-w-0 flex-1 truncate font-mono text-xs">{m.model_id}</span>
-                <span className="rounded bg-gray-800 px-1.5 py-0.5 text-xs text-gray-400">
-                  {MEDIA_LABELS[m.media_type] ?? m.media_type}
+            <div className="min-w-0">
+              <div className="flex items-center gap-2.5">
+                <h3
+                  className="font-editorial"
+                  style={{
+                    fontSize: 22,
+                    fontWeight: 400,
+                    lineHeight: 1.1,
+                    letterSpacing: "-0.012em",
+                    color: "var(--color-text)",
+                  }}
+                >
+                  {provider.display_name}
+                </h3>
+                <span
+                  className="rounded-full px-2.5 py-0.5 font-mono text-[10px] font-bold uppercase tracking-[0.14em]"
+                  style={ready ? READY_BADGE_STYLE : UNCONFIGURED_BADGE_STYLE}
+                >
+                  {ready ? t("status_connected") : t("status_unconfigured")}
                 </span>
-                {m.is_default && (
-                  <span className="rounded bg-indigo-600/30 px-1.5 py-0.5 text-xs text-indigo-300">
-                    默认
-                  </span>
-                )}
-                {!m.is_enabled && (
-                  <span className="text-xs text-gray-600">已禁用</span>
-                )}
               </div>
-            ))}
+              <p className="mt-1.5 font-mono text-[10.5px] uppercase tracking-[0.14em] text-text-4">
+                {protocolLabel(provider.discovery_format).toUpperCase()} ·{" "}
+                <span className="normal-case tracking-normal">{provider.base_url}</span>
+              </p>
+            </div>
           </div>
-        </div>
-      )}
 
-      {/* Test result */}
-      {testResult && (
-        <div
-          aria-live="polite"
-          className={`mb-4 flex items-start gap-2 rounded-lg border px-3 py-2 text-sm ${
-            testResult.success
-              ? "border-green-800/50 bg-green-900/20 text-green-400"
-              : "border-red-800/50 bg-red-900/20 text-red-400"
-          }`}
-        >
-          {testResult.success ? (
-            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-          ) : (
-            <XCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+          {/* Info card */}
+          <div className="rounded-[10px] border border-hairline p-5" style={CARD_STYLE}>
+            <div className="mb-3 font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-accent-2">
+              Connection
+            </div>
+            <div className="space-y-2 text-[12.5px]">
+              <div className="flex justify-between gap-4">
+                <span className="text-text-3">{t("discovery_format_label")}</span>
+                <span className="text-text">{protocolLabel(provider.discovery_format)}</span>
+              </div>
+              <div className="flex justify-between gap-4">
+                <span className="text-text-3">{t("base_url")}</span>
+                <span className="truncate font-mono text-[11.5px] text-text">{provider.base_url}</span>
+              </div>
+              <div className="flex justify-between gap-4">
+                <span className="text-text-3">{t("api_key_label")}</span>
+                <span className="font-mono text-[11.5px] text-text">
+                  {provider.api_key_masked || t("api_key_not_set")}
+                </span>
+              </div>
+              <div className="flex justify-between gap-4">
+                <span className="text-text-3">{t("created_at")}</span>
+                <span className="text-text">
+                  {formatDate(provider.created_at, i18n.language, { year: "numeric", month: "2-digit", day: "2-digit" })}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Models */}
+          {provider.models.length > 0 && (
+            <div>
+              <div className="mb-2 font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-accent-2">
+                {t("model_list")}
+              </div>
+              <div className="space-y-1.5">
+                {provider.models.map((m) => (
+                  <div
+                    key={m.id}
+                    className={`flex items-center gap-2 rounded-[8px] border border-hairline px-3 py-2 text-[12.5px] ${
+                      m.is_enabled ? "text-text" : "text-text-4 opacity-60"
+                    }`}
+                    style={CARD_STYLE}
+                  >
+                    <span className="min-w-0 flex-1 truncate font-mono text-[11.5px]">
+                      {m.model_id}
+                    </span>
+                    <span className="rounded-full border border-hairline-soft bg-bg-grad-a/55 px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-3">
+                      {(() => {
+                        const media = endpointToMediaType[m.endpoint];
+                        return MEDIA_LABELS[media] ? t(MEDIA_LABELS[media]) : media;
+                      })()}
+                    </span>
+                    {m.is_default && (
+                      <span
+                        className="rounded-full px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-[0.14em]"
+                        style={{
+                          background: "var(--color-accent-dim)",
+                          color: "var(--color-accent-2)",
+                          border: "1px solid var(--color-accent-soft)",
+                        }}
+                      >
+                        {t("default_label")}
+                      </span>
+                    )}
+                    {m.supported_durations && m.supported_durations.length > 0 && (
+                      <span className="font-mono text-[10.5px] text-text-4">
+                        {t("supported_durations_summary", {
+                          value: formatDurationsLabel(m.supported_durations),
+                        })}
+                      </span>
+                    )}
+                    {!m.is_enabled && (
+                      <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-4">
+                        {t("model_disabled")}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
           )}
-          <span>{testResult.message}</span>
+
+          {/* ComfyUI：反向代理用自定义头鉴权时探针本就打不通，提前说明以什么为准 */}
+          {isComfyuiProtocol(provider.discovery_format) && (
+            <p className="text-[12px] leading-[1.55] text-text-4">{t("cp_comfyui_connectivity_hint")}</p>
+          )}
+
+          {/* Test result */}
+          {testResult && (
+            <div
+              aria-live="polite"
+              className="flex items-start gap-2 rounded-[8px] px-3 py-2 text-[12px]"
+              style={
+                testResult.success
+                  ? {
+                      background: "oklch(0.30 0.10 155 / 0.15)",
+                      color: "var(--color-good)",
+                      border: "1px solid oklch(0.45 0.10 155 / 0.30)",
+                    }
+                  : {
+                      background: "var(--color-warm-tint)",
+                      color: "var(--color-warm-bright)",
+                      border: "1px solid var(--color-warm-ring)",
+                    }
+              }
+            >
+              {testResult.success ? (
+                <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              ) : (
+                <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              )}
+              <span>{testResult.message}</span>
+            </div>
+          )}
         </div>
-      )}
+      </div>
 
-      </div>{/* end max-w-xl */}
-      </div>{/* end scrollable content */}
-
-      {/* Fixed actions bar — outside scroll area */}
-      <div className="shrink-0 border-t border-gray-800 bg-gray-950 px-6 py-3">
+      {/* Sticky actions bar */}
+      <div
+        className="sticky bottom-0 z-10 border-t border-hairline px-6 py-3 backdrop-blur"
+        style={{
+          background:
+            "linear-gradient(180deg, oklch(0.20 0.011 265 / 0.65), oklch(0.15 0.010 265 / 0.85))",
+        }}
+      >
         <div className="flex items-center gap-3">
           <button
             type="button"
             onClick={() => setEditing(true)}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-sm text-white transition-colors hover:bg-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60"
+            className={ACCENT_BTN_CLS}
+            style={ACCENT_BUTTON_STYLE}
           >
             <Pencil className="h-3.5 w-3.5" />
-            编辑
+            {t("common:edit")}
           </button>
 
           <button
             type="button"
             onClick={() => void handleTest()}
             disabled={testing}
-            className="inline-flex items-center gap-2 rounded-lg border border-gray-700 px-3 py-1.5 text-sm text-gray-300 transition-colors hover:border-gray-600 hover:text-gray-100 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60"
+            className={GHOST_BTN_CLS}
           >
             {testing ? (
               <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                测试中…
+                <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin" />
+                {t("connectivity_checking")}
               </>
             ) : (
-              "测试连接"
+              t("connectivity_check")
             )}
           </button>
 
@@ -247,10 +346,10 @@ export function CustomProviderDetail({ providerId, onDeleted, onSaved }: CustomP
             <button
               type="button"
               onClick={() => setConfirmDelete(true)}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-gray-700 px-3 py-1.5 text-sm text-gray-400 transition-colors hover:border-red-800 hover:text-red-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60"
+              className="inline-flex items-center gap-1.5 rounded-[8px] border border-hairline bg-bg-grad-a/55 px-3 py-1.5 text-[12.5px] text-text-3 transition-colors hover:border-warm-ring hover:text-warm-bright focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             >
               <Trash2 className="h-3.5 w-3.5" />
-              删除
+              {t("common:delete")}
             </button>
           ) : (
             <div className="flex items-center gap-1.5">
@@ -258,17 +357,26 @@ export function CustomProviderDetail({ providerId, onDeleted, onSaved }: CustomP
                 type="button"
                 onClick={() => void handleDelete()}
                 disabled={deleting}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-red-800 bg-red-900/30 px-3 py-1.5 text-sm text-red-400 hover:bg-red-900/50 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/60"
+                className="inline-flex items-center gap-1.5 rounded-[8px] px-3 py-1.5 text-[12.5px] font-semibold transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                style={{
+                  background: "var(--color-warm-tint)",
+                  color: "var(--color-warm-bright)",
+                  border: "1px solid var(--color-warm-ring)",
+                }}
               >
-                {deleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
-                确认删除
+                {deleting ? (
+                  <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin" />
+                ) : (
+                  <Trash2 className="h-3.5 w-3.5" />
+                )}
+                {t("confirm_delete_provider")}
               </button>
               <button
                 type="button"
                 onClick={() => setConfirmDelete(false)}
-                className="rounded-lg border border-gray-700 px-3 py-1.5 text-sm text-gray-400 hover:border-gray-600 hover:text-gray-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60"
+                className={GHOST_BTN_CLS}
               >
-                取消
+                {t("common:cancel")}
               </button>
             </div>
           )}

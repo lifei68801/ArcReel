@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useAssistantSession } from "@/hooks/useAssistantSession";
 import { useAppStore } from "@/stores/app-store";
@@ -45,12 +45,15 @@ function makePendingQuestion() {
 }
 
 describe("AgentCopilot", () => {
-  const sendMessage = vi.fn();
-  const answerQuestion = vi.fn();
-  const interrupt = vi.fn();
+  // Mocks whose callers wrap them with voidPromise must return a Promise
+  // so the .catch(...) chain in voidPromise resolves instead of crashing.
+  const sendMessage = vi.fn().mockResolvedValue(undefined);
+  const rewriteMessage = vi.fn().mockResolvedValue(true);
+  const answerQuestion = vi.fn().mockResolvedValue(undefined);
+  const interrupt = vi.fn().mockResolvedValue(undefined);
   const createNewSession = vi.fn();
-  const switchSession = vi.fn();
-  const deleteSession = vi.fn();
+  const switchSession = vi.fn().mockResolvedValue(undefined);
+  const deleteSession = vi.fn().mockResolvedValue(undefined);
 
   beforeEach(() => {
     useAssistantStore.setState(useAssistantStore.getInitialState(), true);
@@ -61,6 +64,7 @@ describe("AgentCopilot", () => {
     useProjectsStore.getState().setCurrentProject("demo", null);
     mockedUseAssistantSession.mockReturnValue({
       sendMessage,
+      rewriteMessage,
       answerQuestion,
       interrupt,
       createNewSession,
@@ -78,7 +82,7 @@ describe("AgentCopilot", () => {
     render(<AgentCopilot />);
 
     expect(screen.getByText("需要你的选择")).toBeInTheDocument();
-    expect(screen.getByLabelText("助手输入")).toBeDisabled();
+    expect(screen.getByLabelText("Agent 输入")).toBeDisabled();
     expect(screen.getByLabelText("发送消息")).toBeDisabled();
     expect(screen.getByPlaceholderText("请先回答上方问题")).toBeInTheDocument();
   });
@@ -91,7 +95,7 @@ describe("AgentCopilot", () => {
     render(<AgentCopilot />);
 
     fireEvent.click(screen.getByLabelText("摘要"));
-    fireEvent.click(screen.getByRole("button", { name: "完成并提交" }));
+    fireEvent.click(screen.getByRole("button", { name: /完成并提交/ }));
 
     expect(answerQuestion).toHaveBeenCalledWith("q-1", {
       "输出格式是什么？": "摘要",
@@ -120,4 +124,47 @@ describe("AgentCopilot", () => {
     fireEvent.click(screen.getByTitle("切换会话"));
     expect(document.querySelector(`.${UI_LAYERS.assistantLocalPopover}`)).toBeTruthy();
   });
+
+  it("does not send when Enter is used to confirm an IME composition", () => {
+    render(<AgentCopilot />);
+
+    const textarea = screen.getByLabelText("Agent 输入");
+    fireEvent.change(textarea, { target: { value: "你好" } });
+
+    fireEvent.compositionStart(textarea);
+    fireEvent.keyDown(textarea, {
+      key: "Enter",
+      code: "Enter",
+      keyCode: 229,
+      which: 229,
+      isComposing: true,
+    });
+
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    fireEvent.compositionEnd(textarea);
+    fireEvent.keyDown(textarea, {
+      key: "Enter",
+      code: "Enter",
+      keyCode: 13,
+      which: 13,
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith("你好", undefined);
+  });
+
+  it("consumes a one-shot prefill dispatched via the assistant store's input field", async () => {
+    render(<AgentCopilot />);
+
+    act(() => {
+      useAssistantStore.getState().setInput("为第 1 集生成剧本");
+    });
+
+    expect(screen.getByLabelText("Agent 输入")).toHaveValue("为第 1 集生成剧本");
+
+    await waitFor(() => {
+      expect(useAssistantStore.getState().input).toBe("");
+    });
+  });
+
 });

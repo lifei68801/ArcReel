@@ -11,6 +11,8 @@ from contextvars import ContextVar
 from threading import RLock
 from typing import Any, Literal
 
+from lib.i18n import DEFAULT_LOCALE, _
+
 logger = logging.getLogger(__name__)
 
 ProjectChangeSource = Literal["webui", "worker", "filesystem"]
@@ -28,6 +30,19 @@ _current_source: ContextVar[ProjectChangeSource] = ContextVar(
 _listeners: list[ProjectChangeListener] = []
 _batch_listeners: list[ProjectChangeBatchListener] = []
 _listeners_lock = RLock()
+
+
+def build_change_label(label_key: str, **params: Any) -> dict[str, Any]:
+    """Build the label triplet carried by one project change.
+
+    ``label_key`` + ``label_params`` 是稳定契约，界面按用户语言查表成文；``label`` 是同一
+    条目的默认语言渲染结果，只服务日志与不识别 key 的旧消费方，不作为界面文案来源。
+    """
+    return {
+        "label": _(f"event_label_{label_key}", locale=DEFAULT_LOCALE, **params),
+        "label_key": label_key,
+        "label_params": dict(params),
+    }
 
 
 def get_project_change_source() -> ProjectChangeSource:
@@ -87,7 +102,7 @@ def emit_project_change_batch(
 ) -> None:
     """Notify listeners with a ready-to-broadcast project change batch."""
     resolved_source = source or get_project_change_source()
-    payload = tuple(dict(change) for change in changes if isinstance(change, dict))
+    payload = tuple(dict(change) for change in changes)
     if not payload:
         return
 

@@ -6,12 +6,15 @@ import logging
 
 from xai_sdk import chat as xai_chat
 
-from lib.grok_shared import create_grok_client
+from lib.grok_shared import create_grok_client, grok_should_retry
+from lib.logging_utils import format_kwargs_for_log
 from lib.providers import PROVIDER_GROK
+from lib.retry import with_retry_async
 from lib.text_backends.base import (
     TextCapability,
     TextGenerationRequest,
     TextGenerationResult,
+    check_truncation,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,8 +46,12 @@ class GrokTextBackend:
     def capabilities(self) -> set[TextCapability]:
         return self._capabilities
 
+    @with_retry_async(retry_if=grok_should_retry)
     async def generate(self, request: TextGenerationRequest) -> TextGenerationResult:
-        chat = self._client.chat.create(model=self._model)
+        chat_kwargs: dict = {"model": self._model}
+        if request.max_output_tokens is not None:
+            chat_kwargs["max_tokens"] = request.max_output_tokens
+        chat = self._client.chat.create(**chat_kwargs)
 
         # System prompt
         if request.system_prompt:
@@ -65,6 +72,21 @@ class GrokTextBackend:
                     user_parts.append(xai_chat.image(image_url=img_input.url))
 
         chat.append(xai_chat.user(request.prompt, *user_parts))
+
+        logger.info(
+            "调用 %s 文本 SDK payload=%s",
+            self.name,
+            format_kwargs_for_log(
+                {
+                    "model": self._model,
+                    "max_tokens": chat_kwargs.get("max_tokens"),
+                    "system_prompt": request.system_prompt,
+                    "prompt": request.prompt,
+                    "image_count": len(request.images) if request.images else 0,
+                    "structured_output": bool(request.response_schema),
+                }
+            ),
+        )
 
         # Structured output or plain
         if request.response_schema:
@@ -87,6 +109,19 @@ class GrokTextBackend:
             usage = response.usage
             input_tokens = getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", None)
             output_tokens = getattr(usage, "output_tokens", None) or getattr(usage, "completion_tokens", None)
+
+        finish_reason = getattr(response, "finish_reason", None)
+        if finish_reason is None:
+            choices = getattr(response, "choices", None) or []
+            if choices:
+                finish_reason = getattr(choices[0], "finish_reason", None)
+        check_truncation(
+            finish_reason,
+            provider=PROVIDER_GROK,
+            model=self._model,
+            output_tokens=output_tokens,
+            structured=bool(request.response_schema),
+        )
 
         return TextGenerationResult(
             text=text.strip() if isinstance(text, str) else str(text),

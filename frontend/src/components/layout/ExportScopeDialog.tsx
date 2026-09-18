@@ -1,21 +1,23 @@
 import { useState, useEffect } from "react";
-import { Package, History, Clapperboard, ArrowLeft, Loader2 } from "lucide-react";
-import { Popover } from "@/components/ui/Popover";
-import type { RefObject } from "react";
+import {
+  Package,
+  History,
+  Clapperboard,
+  ArrowLeft,
+  Loader2,
+  PackageCheck,
+} from "lucide-react";
+import { GlassPopover } from "@/components/ui/GlassPopover";
+import { PrimaryButton } from "@/components/ui/PrimaryButton";
+import { useTranslation } from "react-i18next";
+import type { RefObject, ReactNode } from "react";
 import type { EpisodeMeta } from "@/types/project";
+import type { PresentationVariant } from "@/types/presentation";
+import { WARM_TONE } from "@/utils/severity-tone";
 
 export type ExportScope = "current" | "full" | "jianying-draft";
 
 const DRAFT_PATH_STORAGE_KEY = "arcreel_jianying_draft_path";
-
-function getDefaultDraftPath(): string {
-  const isWindows =
-    typeof navigator !== "undefined" &&
-    navigator.userAgent.includes("Windows");
-  return isWindows
-    ? String.raw`C:\Users\你的用户名\AppData\Local\JianyingPro\User Data\Projects\com.lveditor.draft`
-    : "/Users/你的用户名/Movies/JianyingPro/User Data/Projects/com.lveditor.draft";
-}
 
 interface ExportScopeDialogProps {
   open: boolean;
@@ -23,7 +25,12 @@ interface ExportScopeDialogProps {
   onSelect: (scope: ExportScope) => void;
   anchorRef: RefObject<HTMLElement | null>;
   episodes?: EpisodeMeta[];
-  onJianyingExport?: (episode: number, draftPath: string, jianyingVersion: string) => void;
+  onJianyingExport?: (
+    episode: number,
+    draftPath: string,
+    jianyingVersion: string,
+    narrationDelivery: PresentationVariant,
+  ) => void;
   jianyingExporting?: boolean;
 }
 
@@ -36,25 +43,32 @@ export function ExportScopeDialog({
   onJianyingExport,
   jianyingExporting = false,
 }: ExportScopeDialogProps) {
+  const { t } = useTranslation(["dashboard", "common"]);
   const [mode, setMode] = useState<"select" | "jianying-form">("select");
   const [selectedEpisode, setSelectedEpisode] = useState<number>(
     episodes.length > 0 ? episodes[0].episode : 1,
   );
+  const isWindows =
+    typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
+  const defaultDraftPath = isWindows
+    ? t("dashboard:draft_path_default_windows")
+    : t("dashboard:draft_path_default_mac");
   const [draftPath, setDraftPath] = useState<string>(
-    () => localStorage.getItem(DRAFT_PATH_STORAGE_KEY) || getDefaultDraftPath(),
+    () => localStorage.getItem(DRAFT_PATH_STORAGE_KEY) || defaultDraftPath,
   );
   const [jianyingVersion, setJianyingVersion] = useState("6");
+  const [narrationDelivery, setNarrationDelivery] = useState<PresentationVariant>("post_production");
 
-  // Reset mode when popover closes
   useEffect(() => {
     if (!open) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- 弹窗关闭时重置到初始选择界面，是有意的 UI 状态重置
       setMode("select");
     }
   }, [open]);
 
-  // Sync selected episode when episodes change
   useEffect(() => {
     if (episodes.length > 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- episodes prop 变化时同步表单默认值，受控拷贝是有意设计
       setSelectedEpisode(episodes[0].episode);
     }
   }, [episodes]);
@@ -62,157 +76,354 @@ export function ExportScopeDialog({
   const handleJianyingSubmit = () => {
     if (!draftPath.trim() || !onJianyingExport) return;
     localStorage.setItem(DRAFT_PATH_STORAGE_KEY, draftPath.trim());
-    onJianyingExport(selectedEpisode, draftPath.trim(), jianyingVersion);
+    onJianyingExport(selectedEpisode, draftPath.trim(), jianyingVersion, narrationDelivery);
   };
 
   return (
-    <Popover
+    <GlassPopover
       open={open}
       onClose={onClose}
       anchorRef={anchorRef}
-      width="w-80"
-      className="rounded-lg border border-gray-700 p-3 shadow-xl"
+      sideOffset={8}
+      width="w-[22rem]"
     >
       {mode === "select" ? (
-        <>
-          <p className="mb-3 text-xs font-medium text-gray-300">选择导出范围</p>
-          <div className="flex flex-col gap-2">
-            <button
-              type="button"
-              onClick={() => onSelect("current")}
-              className="flex items-start gap-3 rounded-md border border-gray-700 px-3 py-2.5 text-left transition-colors hover:border-indigo-500 hover:bg-indigo-500/10"
+        <div className="px-4 pb-3 pt-3.5">
+          <div className="mb-2.5 flex items-center gap-2">
+            <span
+              aria-hidden
+              className="grid h-7 w-7 place-items-center rounded-lg"
+              style={{
+                background:
+                  "linear-gradient(135deg, var(--color-accent-dim), oklch(0.76 0.09 295 / 0.05))",
+                border: "1px solid var(--color-accent-soft)",
+                color: "var(--color-accent-2)",
+                boxShadow: "0 8px 18px -8px var(--color-accent-glow)",
+              }}
             >
-              <Package className="mt-0.5 h-4 w-4 shrink-0 text-indigo-400" />
-              <div>
-                <div className="text-sm font-medium text-gray-200">
-                  仅当前版本
-                  <span className="ml-1.5 rounded bg-indigo-500/20 px-1.5 py-0.5 text-[10px] text-indigo-300">
-                    推荐
-                  </span>
-                </div>
-                <p className="mt-0.5 text-xs text-gray-500">
-                  不含版本历史，体积更小
-                </p>
+              <PackageCheck className="h-3.5 w-3.5" />
+            </span>
+            <div className="min-w-0">
+              <div
+                className="display-serif text-[14px] font-semibold tracking-tight"
+                style={{ color: "var(--color-text)" }}
+              >
+                {t("dashboard:export_scope_title")}
               </div>
-            </button>
-            <button
-              type="button"
-              onClick={() => onSelect("full")}
-              className="flex items-start gap-3 rounded-md border border-gray-700 px-3 py-2.5 text-left transition-colors hover:border-gray-500 hover:bg-gray-800"
-            >
-              <History className="mt-0.5 h-4 w-4 shrink-0 text-gray-400" />
-              <div>
-                <div className="text-sm font-medium text-gray-200">全部数据</div>
-                <p className="mt-0.5 text-xs text-gray-500">
-                  包含完整版本历史
-                </p>
+              <div
+                className="num text-[10px] uppercase"
+                style={{
+                  color: "var(--color-text-4)",
+                  letterSpacing: "1.0px",
+                }}
+              >
+                {t("dashboard:eyebrow_export_scope")}
               </div>
-            </button>
-            <button
-              type="button"
-              onClick={() => setMode("jianying-form")}
-              className="flex items-start gap-3 rounded-md border border-gray-700 px-3 py-2.5 text-left transition-colors hover:border-amber-500 hover:bg-amber-500/10"
-            >
-              <Clapperboard className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
-              <div>
-                <div className="text-sm font-medium text-gray-200">
-                  导出为剪映草稿
-                </div>
-                <p className="mt-0.5 text-xs text-gray-500">
-                  生成剪映可导入的草稿 ZIP
-                </p>
-              </div>
-            </button>
+            </div>
           </div>
-        </>
+
+          <div className="flex flex-col gap-2">
+            <ScopeOption
+              icon={<Package className="h-4 w-4" />}
+              title={
+                <span className="inline-flex items-center gap-1.5">
+                  <span>{t("dashboard:current_version_only")}</span>
+                  <span
+                    className="num rounded-[3px] px-1.5 py-px text-[9.5px] uppercase"
+                    style={{
+                      letterSpacing: "0.6px",
+                      color: "var(--color-accent-2)",
+                      background: "var(--color-accent-dim)",
+                      border: "1px solid var(--color-accent-soft)",
+                    }}
+                  >
+                    {t("dashboard:recommended")}
+                  </span>
+                </span>
+              }
+              hint={t("dashboard:small_size_hint")}
+              tone="accent"
+              onClick={() => onSelect("current")}
+            />
+            <ScopeOption
+              icon={<History className="h-4 w-4" />}
+              title={t("dashboard:all_data")}
+              hint={t("dashboard:full_history_hint")}
+              tone="neutral"
+              onClick={() => onSelect("full")}
+            />
+            <ScopeOption
+              icon={<Clapperboard className="h-4 w-4" />}
+              title={t("dashboard:export_jianying_draft")}
+              hint={t("dashboard:generate_jianying_zip_hint")}
+              tone="warm"
+              onClick={() => setMode("jianying-form")}
+            />
+          </div>
+        </div>
       ) : (
-        <>
+        <div className="px-4 pb-4 pt-3.5">
           <div className="mb-3 flex items-center gap-2">
             <button
               type="button"
               onClick={() => setMode("select")}
-              className="rounded p-0.5 text-gray-400 transition-colors hover:bg-gray-800 hover:text-gray-200"
-              aria-label="返回"
+              className="arc-close-btn focus-ring grid h-6 w-6 place-items-center rounded-md"
+              aria-label={t("common:back")}
             >
-              <ArrowLeft className="h-4 w-4" />
+              <ArrowLeft className="h-3.5 w-3.5" />
             </button>
-            <p className="text-xs font-medium text-gray-300">导出为剪映草稿</p>
+            <span
+              aria-hidden
+              className="grid h-7 w-7 place-items-center rounded-lg"
+              style={{
+                background:
+                  "linear-gradient(135deg, var(--color-warm-tint), var(--color-warm-tint-faint))",
+                border: `1px solid ${WARM_TONE.ring}`,
+                color: WARM_TONE.color,
+                boxShadow: `0 8px 18px -8px ${WARM_TONE.glow}`,
+              }}
+            >
+              <Clapperboard className="h-3.5 w-3.5" />
+            </span>
+            <div
+              className="display-serif text-[14px] font-semibold tracking-tight"
+              style={{ color: "var(--color-text)" }}
+            >
+              {t("dashboard:export_jianying_draft")}
+            </div>
           </div>
           <div className="flex flex-col gap-3">
-            {/* Episode selector — hidden when only one episode */}
             {episodes.length > 1 && (
-              <div>
-                <label htmlFor="jianying-episode-select" className="mb-1 block text-xs text-gray-400">
-                  选择集数
-                </label>
+              <FormField
+                htmlFor="jianying-episode-select"
+                label={t("dashboard:select_episode")}
+              >
                 <select
                   id="jianying-episode-select"
                   value={selectedEpisode}
                   onChange={(e) => setSelectedEpisode(Number(e.target.value))}
-                  className="w-full rounded-md border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-sm text-gray-200 outline-none focus:border-indigo-500"
+                  className="focus-ring w-full rounded-md px-2.5 py-1.5 text-[13px] outline-none"
+                  style={{
+                    background: "oklch(0.16 0.010 265 / 0.6)",
+                    border: "1px solid var(--color-hairline)",
+                    color: "var(--color-text)",
+                  }}
                 >
                   {episodes.map((ep) => (
                     <option key={ep.episode} value={ep.episode}>
-                      第 {ep.episode} 集 — {ep.title}
+                      {t("dashboard:episode_with_title", {
+                        episode: ep.episode,
+                        title: ep.title,
+                      })}
                     </option>
                   ))}
                 </select>
-              </div>
+              </FormField>
             )}
 
-            {/* JianYing version selector */}
-            <div>
-              <label htmlFor="jianying-version-select" className="mb-1 block text-xs text-gray-400">
-                剪映版本
-              </label>
+            <FormField
+              htmlFor="jianying-presentation-variant"
+              label={t("dashboard:presentation_variant")}
+            >
+              <select
+                id="jianying-presentation-variant"
+                value={narrationDelivery}
+                onChange={(event) => setNarrationDelivery(event.target.value as PresentationVariant)}
+                className="focus-ring w-full rounded-md px-2.5 py-1.5 text-[13px] outline-none"
+                style={{
+                  background: "oklch(0.16 0.010 265 / 0.6)",
+                  border: "1px solid var(--color-hairline)",
+                  color: "var(--color-text)",
+                }}
+              >
+                <option value="post_production">{t("dashboard:presentation_post_production")}</option>
+                <option value="use_tts">{t("dashboard:presentation_use_tts")}</option>
+              </select>
+            </FormField>
+
+            <FormField
+              htmlFor="jianying-version-select"
+              label={t("dashboard:jianying_version")}
+            >
               <select
                 id="jianying-version-select"
                 value={jianyingVersion}
                 onChange={(e) => setJianyingVersion(e.target.value)}
-                className="w-full rounded-md border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-sm text-gray-200 outline-none focus:border-indigo-500"
+                className="focus-ring w-full rounded-md px-2.5 py-1.5 text-[13px] outline-none"
+                style={{
+                  background: "oklch(0.16 0.010 265 / 0.6)",
+                  border: "1px solid var(--color-hairline)",
+                  color: "var(--color-text)",
+                }}
               >
-                <option value="6">剪映 6.0 及以上（推荐）</option>
-                <option value="5">剪映 5.x</option>
+                <option value="6">{t("dashboard:jianying_v6_plus")}</option>
+                <option value="5">{t("dashboard:jianying_v5_x")}</option>
               </select>
-            </div>
+            </FormField>
 
-            {/* Draft path input */}
-            <div>
-              <label htmlFor="jianying-draft-path" className="mb-1 block text-xs text-gray-400">
-                草稿目录路径
-              </label>
+            <FormField
+              htmlFor="jianying-draft-path"
+              label={t("dashboard:draft_path")}
+              hint={t("dashboard:draft_path_hint")}
+            >
               <input
                 id="jianying-draft-path"
                 type="text"
                 value={draftPath}
                 onChange={(e) => setDraftPath(e.target.value)}
-                placeholder="剪映草稿目录路径"
-                className="w-full rounded-md border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-sm text-gray-200 placeholder:text-gray-600 outline-none focus:border-indigo-500"
+                placeholder={t("dashboard:draft_path_placeholder")}
+                className="focus-ring w-full rounded-md px-2.5 py-1.5 text-[13px] outline-none"
+                style={{
+                  background: "oklch(0.16 0.010 265 / 0.6)",
+                  border: "1px solid var(--color-hairline)",
+                  color: "var(--color-text)",
+                  fontFamily: "var(--font-mono)",
+                }}
               />
-              <p className="mt-1.5 text-[11px] leading-relaxed text-gray-500">
-                请填入剪映草稿目录的完整路径。打开剪映 → 设置 → 草稿位置 可查看。
-              </p>
-            </div>
+            </FormField>
 
-            {/* Submit */}
-            <button
-              type="button"
+            <PrimaryButton
+              tone="warm"
+              size="sm"
               onClick={handleJianyingSubmit}
               disabled={!draftPath.trim() || jianyingExporting}
-              className="flex items-center justify-center gap-1.5 rounded-md bg-amber-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {jianyingExporting ? (
-                <>
+              leadingIcon={
+                jianyingExporting ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  导出中...
-                </>
-              ) : (
-                "导出草稿"
-              )}
-            </button>
+                ) : undefined
+              }
+            >
+              {jianyingExporting
+                ? t("dashboard:exporting")
+                : t("dashboard:export_draft")}
+            </PrimaryButton>
           </div>
-        </>
+        </div>
       )}
-    </Popover>
+    </GlassPopover>
+  );
+}
+
+type ScopeTone = "accent" | "neutral" | "warm";
+
+const SCOPE_PALETTE: Record<
+  ScopeTone,
+  { color: string; ring: string; hoverBg: string; hoverBorder: string }
+> = {
+  accent: {
+    color: "var(--color-accent-2)",
+    ring: "var(--color-accent-soft)",
+    hoverBg: "var(--color-accent-dim)",
+    hoverBorder: "var(--color-accent-soft)",
+  },
+  warm: {
+    color: WARM_TONE.color,
+    ring: WARM_TONE.ring,
+    hoverBg: WARM_TONE.soft,
+    hoverBorder: WARM_TONE.ring,
+  },
+  neutral: {
+    color: "var(--color-text-3)",
+    ring: "var(--color-hairline)",
+    hoverBg: "oklch(1 0 0 / 0.04)",
+    hoverBorder: "var(--color-hairline-strong)",
+  },
+};
+
+function ScopeOption({
+  icon,
+  title,
+  hint,
+  tone,
+  onClick,
+}: {
+  icon: ReactNode;
+  title: ReactNode;
+  hint: string;
+  tone: ScopeTone;
+  onClick: () => void;
+}) {
+  const palette = SCOPE_PALETTE[tone];
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="focus-ring group flex items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-colors"
+      style={{
+        border: "1px solid var(--color-hairline)",
+        background: "oklch(0.20 0.011 265 / 0.4)",
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.background = palette.hoverBg;
+        e.currentTarget.style.borderColor = palette.hoverBorder;
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.background = "oklch(0.20 0.011 265 / 0.4)";
+        e.currentTarget.style.borderColor = "var(--color-hairline)";
+      }}
+    >
+      <span
+        aria-hidden
+        className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-md"
+        style={{
+          background: "oklch(0.16 0.010 265 / 0.6)",
+          border: `1px solid ${palette.ring}`,
+          color: palette.color,
+        }}
+      >
+        {icon}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div
+          className="text-[13px] font-medium leading-tight"
+          style={{ color: "var(--color-text)" }}
+        >
+          {title}
+        </div>
+        <p
+          className="mt-1 text-[11.5px] leading-[1.5]"
+          style={{ color: "var(--color-text-4)" }}
+        >
+          {hint}
+        </p>
+      </div>
+    </button>
+  );
+}
+
+function FormField({
+  htmlFor,
+  label,
+  hint,
+  children,
+}: {
+  htmlFor: string;
+  label: string;
+  hint?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div>
+      <label
+        htmlFor={htmlFor}
+        className="num mb-1 block text-[10px] uppercase"
+        style={{
+          color: "var(--color-text-4)",
+          letterSpacing: "1.0px",
+        }}
+      >
+        {label}
+      </label>
+      {children}
+      {hint && (
+        <p
+          className="mt-1.5 text-[11px] leading-[1.55]"
+          style={{ color: "var(--color-text-4)" }}
+        >
+          {hint}
+        </p>
+      )}
+    </div>
   );
 }

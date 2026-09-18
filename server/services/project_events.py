@@ -5,47 +5,87 @@ Project data change detection and SSE fanout for workspace realtime updates.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
-import json
 import logging
 import uuid
+from collections import Counter
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from lib import PROJECT_ROOT
+from lib.content_digest import canonical_json_bytes
+from lib.episode_paths import episode_script_filename
 from lib.project_change_hints import (
     ProjectChangeBatch,
     ProjectChangeSource,
+    build_change_label,
     project_change_source,
     register_project_change_batch_listener,
     register_project_change_listener,
 )
 from lib.project_manager import ProjectManager
+from lib.script_models import get_generated_assets
+from lib.script_skeleton import (
+    SKELETON_ANCHOR_TYPES,
+    SKELETON_ENTITY_TYPES,
+    SKELETON_ITEM_LABEL_KEYS,
+    SKELETONS,
+    resolve_kind_items,
+)
+from server.sse_channel import IDLE, DropSubscriber, SseChannel
 
 logger = logging.getLogger(__name__)
 
 PROJECT_EVENTS_POLL_SECONDS = 0.5
+
+# 项目目录被删除后向订阅者广播的终止事件名——流在其后正常结束（见 stream_events._iter）。
+PROJECT_DELETED_EVENT = "project_deleted"
 
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _stable_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
 def _fingerprint(value: Any) -> str:
-    return hashlib.sha1(_stable_json(value).encode("utf-8")).hexdigest()
+    return hashlib.sha1(canonical_json_bytes(value)).hexdigest()
+
+
+# 同一件事在发布方与快照差分两侧的 action 命名差异：参考生视频任务完成时，发布方按 task_type
+# 映射为 ``reference_video_ready``（见 generation_tasks._SKELETON_DRIVEN_TASK_ACTIONS），而快照
+# 差分表示为 ``video_ready``。两侧 entity_type/entity_id 相同，
+# 只有 action 不同，不归一会让同一次完成广播成两条。
+_EQUIVALENT_ACTIONS: dict[str, str] = {"reference_video_ready": "video_ready"}
+
+
+def _change_identity(change: dict[str, Any]) -> tuple[Any, Any, Any]:
+    """变更去重身份。
+
+    只取 entity_type/action/entity_id：script_file 与 episode 由发布方按 task_type 选择性
+    附带，纳入身份会让同一件事因一侧为 None 而判成两条。action 经 ``_EQUIVALENT_ACTIONS``
+    归一，抹平发布方与快照差分对同一件事的命名差异。
+    """
+    action = change.get("action")
+    if isinstance(action, str):
+        action = _EQUIVALENT_ACTIONS.get(action, action)
+    return (change.get("entity_type"), action, change.get("entity_id"))
 
 
 @dataclass
 class _ProjectChannel:
-    subscribers: set[asyncio.Queue] = field(default_factory=set)
+    sse: SseChannel
     ready_event: asyncio.Event = field(default_factory=asyncio.Event)
     scan_now: asyncio.Event = field(default_factory=asyncio.Event)
+    # 串行化「读盘 → 结算基线 → 广播」这段读-改-写：轮询扫描与显式重建并发时，读盘耗时
+    # 不同会让先读到旧盘的一方后结算，把陈旧快照写回基线并 diff 出反向变更（实际存在的
+    # 实体被广播成 deleted）。不重置该锁——重建 task 可能跨 watch task 重启仍持有它。
+    rebuild_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # 已发布、尚未广播的显式批次各自描述的变更身份。重建读盘会捎带其它批次已落盘的产物，
+    # 补扫需把它们让给自己那一批去广播，否则同一件事先被补扫发一次、再被本批发一次。
+    inflight_batch_identities: Counter[tuple[Any, Any, Any]] = field(default_factory=Counter)
     pending_sources: set[ProjectChangeSource] = field(default_factory=set)
     task: asyncio.Task | None = None
     snapshot: dict[str, Any] | None = None
@@ -57,15 +97,22 @@ class ProjectEventService:
         self,
         project_root: Path | None = None,
         *,
+        projects_root: Path | None = None,
         poll_interval: float = PROJECT_EVENTS_POLL_SECONDS,
     ):
         self.project_root = Path(project_root or PROJECT_ROOT)
-        self.pm = ProjectManager(self.project_root / "projects")
+        # 显式传入 ``projects_root`` 时优先使用（生产入口走 ``app_data_dir()``），
+        # 否则保留旧契约（仓库根下的 ``projects/``）兼容测试 fixture。
+        projects_dir = (
+            Path(projects_root).resolve(strict=False) if projects_root is not None else self.project_root / "projects"
+        )
+        self.pm = ProjectManager(projects_dir)
         self.poll_interval = max(0.1, float(poll_interval))
         self._channels: dict[str, _ProjectChannel] = {}
         self._listener_unregister = None
         self._batch_listener_unregister = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._pending_batch_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         if self._listener_unregister is not None or self._batch_listener_unregister is not None:
@@ -85,47 +132,135 @@ class ProjectEventService:
             batch_unregister()
 
         tasks = [channel.task for channel in self._channels.values() if channel.task is not None]
+        tasks.extend(self._pending_batch_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._pending_batch_tasks.clear()
         self._channels.clear()
         self._loop = None
 
-    async def subscribe(self, project_name: str) -> tuple[asyncio.Queue, dict[str, Any]]:
-        self.pm.get_project_path(project_name)
-        channel = self._channels.get(project_name)
-        if channel is None:
-            channel = _ProjectChannel()
-            self._channels[project_name] = channel
+    def _create_channel(self, project_name: str) -> _ProjectChannel:
+        """构造项目通道：溢出策略「移除订阅者」，首/末订阅者钩子启停后台扫描。"""
+        sse = SseChannel(
+            overflow=DropSubscriber(
+                on_removed=lambda count: logger.warning(
+                    "项目事件订阅队列溢出，移除 %s 个订阅者 project=%s",
+                    count,
+                    project_name,
+                ),
+            ),
+            on_first_subscriber=lambda: self._start_watch(project_name),
+            on_last_subscriber=lambda: self._stop_watch(project_name),
+        )
+        return _ProjectChannel(sse=sse)
 
-        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-        channel.subscribers.add(queue)
+    def _start_watch(self, project_name: str) -> None:
+        """首订阅者钩子：启动（或重启已自行退出的）后台扫描任务。
 
-        if channel.task is None or channel.task.done():
-            channel.ready_event = asyncio.Event()
-            channel.scan_now = asyncio.Event()
-            channel.pending_sources.clear()
-            channel.task = asyncio.create_task(
-                self._watch_project(project_name, channel),
-                name=f"project-events-{project_name}",
-            )
-
-        await channel.ready_event.wait()
-        return queue, self._build_snapshot_payload(project_name, channel)
-
-    async def unsubscribe(self, project_name: str, queue: asyncio.Queue) -> None:
+        溢出移除掉最后一个订阅者时 watch task 经 ``while has_subscribers`` 自行
+        退出而通道仍留在注册表，故重启条件是「任务不在跑」而非仅「首次订阅」。
+        """
         channel = self._channels.get(project_name)
         if channel is None:
             return
-        channel.subscribers.discard(queue)
-        if channel.subscribers:
+        if channel.task is not None and not channel.task.done():
+            return
+        channel.ready_event = asyncio.Event()
+        channel.scan_now = asyncio.Event()
+        channel.pending_sources.clear()
+        channel.task = asyncio.create_task(
+            self._watch_project(project_name, channel),
+            name=f"project-events-{project_name}",
+        )
+
+    async def _stop_watch(self, project_name: str) -> None:
+        """末订阅者钩子：停止后台扫描任务并注销通道。
+
+        先从注册表摘除通道再 await watch task 退出——摘除与取回之间无让出点，
+        摘的正是当前通道。收尾期间让出事件循环时，并发进入的新订阅者取不到这个
+        将死通道，会新建独立通道注册入表，不会被本次收尾的删除连带摘掉。
+        """
+        channel = self._channels.pop(project_name, None)
+        if channel is None:
             return
         task = channel.task
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        self._channels.pop(project_name, None)
+
+    async def _subscribe(self, project_name: str) -> tuple[SseChannel, asyncio.Queue, dict[str, Any]]:
+        """Register a queue for *project_name* and return it with the initial snapshot.
+
+        Private: the only consumer is :meth:`stream_events`, which owns the
+        deterministic unsubscribe via its context-manager ``__aexit__``.
+        """
+        await asyncio.to_thread(self.pm.get_project_path, project_name)
+        channel = self._channels.get(project_name)
+        if channel is None:
+            channel = self._create_channel(project_name)
+            self._channels[project_name] = channel
+
+        # 队列在首次扫描启动前注册(首订阅者钩子在注册后触发)，否则会漏掉
+        # 扫描完成到注册之间广播的事件。
+        queue = channel.sse.subscribe()
+
+        try:
+            await channel.ready_event.wait()
+        except BaseException:
+            # 客户端在首次扫描期间断开会取消这里:此时 _subscribe 尚未返回 queue,
+            # stream_events 的 try/finally 进不去。同步清理掉刚注册的订阅者(空闲项目
+            # 下 watch task 不会自愈),不 await 以免取消重入——绕过异步末位钩子，
+            # 收尾自理。
+            if channel.sse.unsubscribe_nowait(queue) and channel.task is not None:
+                channel.task.cancel()
+                self._channels.pop(project_name, None)
+            raise
+        return channel.sse, queue, self._build_snapshot_payload(project_name, channel)
+
+    async def _unsubscribe(self, project_name: str, queue: asyncio.Queue) -> None:
+        """Remove a queue; the last-subscriber hook stops the watch task."""
+        channel = self._channels.get(project_name)
+        if channel is None:
+            return
+        await channel.sse.unsubscribe(queue)
+
+    @contextlib.asynccontextmanager
+    async def stream_events(
+        self, project_name: str, *, idle_timeout: float = 1.0
+    ) -> AsyncGenerator[AsyncIterator[tuple[str, Any] | dict[str, Any]]]:
+        """Subscribe to a project's events as a self-cleaning async iterator.
+
+        Yields an async iterator producing, in order:
+
+        - a ``("snapshot", payload)`` tuple as the first event (initial state),
+        - live ``(event_name, payload)`` tuples as changes are broadcast,
+        - a ``{"type": "_idle"}`` sentinel whenever *idle_timeout* elapses with no
+          event (consumers poll disconnect on it).
+
+        The "queue full → silently drop subscriber" overflow semantics are
+        unchanged (:class:`DropSubscriber` — no overflow signal, the stream keeps
+        idling). Subscription and unsubscribe live behind this seam; cleanup is
+        carried by ``__aexit__`` (see ADR-0005). Consume as
+        ``async with stream_events(...) as stream: async for item in stream``.
+        """
+        sse, queue, snapshot = await self._subscribe(project_name)
+
+        async def _iter() -> AsyncIterator[tuple[str, Any] | dict[str, Any]]:
+            # NOTE: intentionally NO ``finally: _unsubscribe`` here — cleanup is owned
+            # by the enclosing context manager's __aexit__ (ADR-0005). Do not add one.
+            yield ("snapshot", snapshot)
+            async for item in sse.iterate(queue, idle_timeout=idle_timeout):
+                yield {"type": "_idle"} if item is IDLE else item
+                # 项目已被删除：终止事件之后流正常结束，不再等待下一条广播或空闲心跳。
+                if isinstance(item, tuple) and item[0] == PROJECT_DELETED_EVENT:
+                    return
+
+        try:
+            yield _iter()
+        finally:
+            await self._unsubscribe(project_name, queue)
 
     def _on_hint(
         self,
@@ -189,34 +324,186 @@ class ProjectEventService:
 
         channel.scan_now.clear()
 
-        try:
-            self._ensure_script_index_synced(project_name)
-            snapshot = self._build_snapshot(project_name)
-            fingerprint = _fingerprint(snapshot)
-            channel.snapshot = snapshot
-            channel.fingerprint = fingerprint
-            channel.pending_sources.clear()
-        except Exception:
-            logger.exception("构建显式项目事件快照失败 project=%s", project_name)
-            return
+        # 在册时机必须早于本批重建读盘，其它批次的补扫才让得掉这些身份
+        identities = Counter(_change_identity(change) for change in changes)
+        channel.inflight_batch_identities.update(identities)
 
+        # 文件 I/O 下沉到线程池，状态更新和广播留在事件循环
+        task = asyncio.create_task(
+            self._async_rebuild_and_broadcast(project_name, channel, source, changes, identities),
+            name=f"batch-rebuild-{project_name}",
+        )
+        self._pending_batch_tasks.add(task)
+        task.add_done_callback(self._pending_batch_tasks.discard)
+
+    async def _async_rebuild_and_broadcast(
+        self,
+        project_name: str,
+        channel: _ProjectChannel,
+        source: ProjectChangeSource,
+        changes: tuple[ProjectChangeBatch, ...],
+        identities: Counter[tuple[Any, Any, Any]],
+    ) -> None:
+        """文件 I/O 在线程中执行，状态更新和广播在事件循环线程中执行。"""
+        try:
+            async with channel.rebuild_lock:
+                # 读盘前在册的来源标记整体换出：读盘期间新增的 hint 落进新集合，留给下一轮扫描
+                # 结算。若改为读盘后减去旧集合，同一来源在窗口内重复到达会被一并减掉，那条新
+                # 变更会在下一轮扫描被 _resolve_batch_source 误标成 filesystem。
+                covered_sources = channel.pending_sources
+                channel.pending_sources = set()
+                try:
+                    snapshot, fingerprint = await asyncio.to_thread(self._rebuild_snapshot, project_name)
+                except FileNotFoundError:
+                    channel.pending_sources |= covered_sources
+                    await self._handle_scan_file_not_found(
+                        project_name, channel, log_message="构建显式项目事件快照失败 project=%s"
+                    )
+                    return
+                except Exception:
+                    channel.pending_sources |= covered_sources
+                    logger.exception("构建显式项目事件快照失败 project=%s", project_name)
+                    return
+
+                # 以下在事件循环线程中执行，线程安全
+                previous = channel.snapshot
+                channel.snapshot = snapshot
+                channel.fingerprint = fingerprint
+
+                self._broadcast_changes(
+                    project_name,
+                    channel,
+                    fingerprint=fingerprint,
+                    source=source,
+                    changes=[dict(change) for change in changes],
+                )
+
+                swept = self._sweep_uncovered_changes(previous, snapshot, channel.inflight_batch_identities)
+                if swept:
+                    # 补扫的变更不属于本批，来源按自己的 hint 标记解析，与轮询扫描同一口径：
+                    # 沿用本批 source 会让 WebUI 自身的编辑被标成 worker（前端据此弹通知并自动
+                    # 导航），或反之漏掉 worker 产物的通知。
+                    self._broadcast_changes(
+                        project_name,
+                        channel,
+                        fingerprint=fingerprint,
+                        source=self._resolve_batch_source(covered_sources),
+                        changes=swept,
+                    )
+        finally:
+            channel.inflight_batch_identities -= identities
+
+    def _broadcast_changes(
+        self,
+        project_name: str,
+        channel: _ProjectChannel,
+        *,
+        fingerprint: str,
+        source: ProjectChangeSource,
+        changes: list[dict[str, Any]],
+    ) -> None:
+        """向订阅者广播一批变更（轮询扫描与显式重建两条路径共用同一 payload 形状）。"""
         payload = {
             "project_name": project_name,
             "batch_id": uuid.uuid4().hex,
             "fingerprint": fingerprint,
             "generated_at": _utc_now_iso(),
             "source": source,
-            "changes": [dict(change) for change in changes],
+            "changes": changes,
         }
-        self._broadcast(project_name, channel, "changes", payload)
+        channel.sse.broadcast(("changes", payload))
+
+    def _sweep_uncovered_changes(
+        self,
+        previous: dict[str, Any] | None,
+        snapshot: dict[str, Any],
+        covered: Counter[tuple[Any, Any, Any]],
+    ) -> list[dict[str, Any]]:
+        """新快照相对基线多出、而任何在途显式批次都未描述的变更。
+
+        重建读盘会捎带任何已落盘的变更，而本批 changes 只描述发布方自己那一件事。
+        新快照被无条件写回基线，捎带进来的变更若不在本次广播里，后续扫描与基线已无
+        差异，就再没有任何机制为它补发——故在此对基线做一次 diff 补发未覆盖的部分。
+
+        ``covered`` 是在途批次身份登记表（含本批自己），这些身份让给各自那一批广播，
+        免得同一件事被补扫先发一次、再被它自己的批次发一次。残留窗口：某批次的产物已
+        落盘、而它的 emit 调用晚于本次读盘返回，此时该身份尚未在册，仍会重复一次。
+        """
+        if previous is None:
+            return []
+        return [
+            change for change in self._diff_snapshots(previous, snapshot) if _change_identity(change) not in covered
+        ]
+
+    def _rebuild_snapshot(self, project_name: str) -> tuple[dict[str, Any], str]:
+        """同步方法（在线程池中执行）：重建快照并返回 (snapshot, fingerprint)。"""
+        self._ensure_script_index_synced(project_name)
+        snapshot = self._build_snapshot(project_name)
+        return snapshot, _fingerprint(snapshot)
+
+    def _project_directory_gone(self, project_name: str) -> bool:
+        """判定项目目录当前是否确已不存在（``get_project_path`` 语义）。
+
+        供扫描 / hint 重建路径捕获 ``FileNotFoundError`` 后做一次独立的现状复核，
+        与「project.json 等深层文件缺失但目录仍在」区分——后者维持现状，按通用
+        异常兜底记 ERROR，不触发终止流程。用复核而非扫描起点的一次性判断，是因为
+        目录删除（如 ``shutil.rmtree``）本身非原子：扫描可能在删除过程中的任意
+        中间状态命中 ``FileNotFoundError``（如 project.json 先于目录本身被移除），
+        起点检查会误判为「未删除」；复核反映的是异常发生后的当前实况。
+        """
+        try:
+            self.pm.get_project_path(project_name)
+        except FileNotFoundError:
+            return True
+        return False
+
+    def _handle_project_deleted(self, project_name: str, channel: _ProjectChannel) -> None:
+        """项目目录已被删除：终止该通道——广播终止事件、移出注册表、取消 watch task。
+
+        轮询扫描与 hint 重建两条路径都可能独立探测到同一次删除并落到本方法；
+        按「本通道是否仍是注册表现行通道」判定是否为首次终止，避免重复广播/
+        重复日志，也避免误杀同名项目重建后已注册的新通道。
+        """
+        if self._channels.get(project_name) is not channel:
+            return
+        self._channels.pop(project_name, None)
+        channel.sse.broadcast((PROJECT_DELETED_EVENT, {"project_name": project_name}))
+        logger.info("项目已被删除，终止事件流 project=%s", project_name)
+        task = channel.task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _handle_scan_file_not_found(
+        self, project_name: str, channel: _ProjectChannel, *, log_message: str
+    ) -> bool:
+        """扫描 / hint 重建路径捕获 ``FileNotFoundError`` 后的统一处理：复核目录是否确已
+        消失，是则终止通道并返回 ``True``；否则维持现状按 ERROR 兜底并返回 ``False``。
+
+        供 :meth:`_async_rebuild_and_broadcast` 与 :meth:`_watch_project` 两条独立路径
+        共用，避免各自维护一份相同判定逻辑、日后修改判定条件时漏改其中一处。
+        """
+        if await asyncio.to_thread(self._project_directory_gone, project_name):
+            self._handle_project_deleted(project_name, channel)
+            return True
+        logger.exception(log_message, project_name)
+        return False
 
     async def _watch_project(self, project_name: str, channel: _ProjectChannel) -> None:
         try:
-            while channel.subscribers:
+            while channel.sse.has_subscribers:
                 try:
-                    self._scan_project(project_name, channel)
+                    async with channel.rebuild_lock:
+                        # 仅文件 I/O 在线程中执行
+                        snapshot, fingerprint = await asyncio.to_thread(self._rebuild_snapshot, project_name)
+                        # 状态更新和广播在事件循环线程中执行（线程安全）
+                        self._apply_scan_result(project_name, channel, snapshot, fingerprint)
                 except asyncio.CancelledError:
                     raise
+                except FileNotFoundError:
+                    if await self._handle_scan_file_not_found(
+                        project_name, channel, log_message="项目事件扫描失败 project=%s"
+                    ):
+                        return
                 except Exception:
                     logger.exception("项目事件扫描失败 project=%s", project_name)
                 finally:
@@ -231,11 +518,14 @@ class ProjectEventService:
         except asyncio.CancelledError:
             raise
 
-    def _scan_project(self, project_name: str, channel: _ProjectChannel) -> None:
-        self._ensure_script_index_synced(project_name)
-        snapshot = self._build_snapshot(project_name)
-        fingerprint = _fingerprint(snapshot)
-
+    def _apply_scan_result(
+        self,
+        project_name: str,
+        channel: _ProjectChannel,
+        snapshot: dict[str, Any],
+        fingerprint: str,
+    ) -> None:
+        """在事件循环线程中更新 channel 状态并广播变更。"""
         if channel.snapshot is None:
             channel.snapshot = snapshot
             channel.fingerprint = fingerprint
@@ -254,15 +544,13 @@ class ProjectEventService:
         if not changes:
             return
 
-        payload = {
-            "project_name": project_name,
-            "batch_id": uuid.uuid4().hex,
-            "fingerprint": fingerprint,
-            "generated_at": _utc_now_iso(),
-            "source": source,
-            "changes": changes,
-        }
-        self._broadcast(project_name, channel, "changes", payload)
+        self._broadcast_changes(
+            project_name,
+            channel,
+            fingerprint=fingerprint,
+            source=source,
+            changes=changes,
+        )
 
     def _build_snapshot_payload(
         self,
@@ -285,28 +573,6 @@ class ProjectEventService:
             return "webui"
         return "filesystem"
 
-    def _broadcast(
-        self,
-        project_name: str,
-        channel: _ProjectChannel,
-        event: str,
-        payload: dict[str, Any],
-    ) -> None:
-        stale: list[asyncio.Queue] = []
-        for subscriber in channel.subscribers:
-            try:
-                subscriber.put_nowait((event, payload))
-            except asyncio.QueueFull:
-                stale.append(subscriber)
-        for subscriber in stale:
-            channel.subscribers.discard(subscriber)
-        if stale:
-            logger.warning(
-                "项目事件订阅队列溢出，移除 %s 个订阅者 project=%s",
-                len(stale),
-                project_name,
-            )
-
     def _ensure_script_index_synced(self, project_name: str) -> None:
         project_path = self.pm.get_project_path(project_name)
         scripts_dir = project_path / "scripts"
@@ -314,33 +580,78 @@ class ProjectEventService:
             return
 
         project = self.pm.load_project(project_name)
-        current_episodes = {
-            int(ep.get("episode")): {
+        current_episodes: dict[int, dict[str, str]] = {}
+        for ep in project.get("episodes") or []:
+            if not isinstance(ep, dict):
+                continue
+            episode_num = ep.get("episode")
+            if not isinstance(episode_num, int):
+                continue
+            current_episodes[episode_num] = {
                 "title": str(ep.get("title") or ""),
                 "script_file": str(ep.get("script_file") or ""),
             }
-            for ep in project.get("episodes", [])
-            if isinstance(ep, dict) and isinstance(ep.get("episode"), int)
-        }
 
-        for script_path in sorted(scripts_dir.glob("*.json")):
+        def _load_candidate(script_path: Path) -> tuple[int, str] | None:
             try:
                 script = self.pm.load_script(project_name, script_path.name)
             except Exception:
                 logger.warning("跳过无法读取的剧本文件 project=%s file=%s", project_name, script_path.name)
-                continue
+                return None
 
             episode = script.get("episode")
             if not isinstance(episode, int):
-                continue
+                return None
             title = str(script.get("title") or "")
+            try:
+                self.pm.require_filename_episode_consistency(script, script_path.name)
+            except ValueError as exc:
+                logger.warning(
+                    "剧集集号不一致，跳过同步 project=%s file=%s reason=%s",
+                    project_name,
+                    script_path.name,
+                    exc,
+                )
+                return None
+            return episode, title
+
+        # 只有文件名正是该集规范名（episode_N.json）的剧本登记为集绑定；其他 JSON（副本、自定义名）
+        # 不读也不登记，已有绑定不被它们改写。
+        candidates: dict[int, Path] = {}
+        for script_path in sorted(scripts_dir.glob("episode_*.json")):
+            filename_episode = ProjectManager.filename_episode(script_path.name)
+            if filename_episode is None or script_path.name != episode_script_filename(filename_episode):
+                continue
+            candidate = _load_candidate(script_path)
+            if candidate is None:
+                continue
+            candidates[candidate[0]] = script_path
+
+        for episode, script_path in sorted(candidates.items()):
+            boundary_candidate = _load_candidate(script_path)
+            if boundary_candidate is None:
+                continue
+            boundary_episode, title = boundary_candidate
+            if boundary_episode != episode:
+                continue
             expected_script_file = f"scripts/{script_path.name}"
             existing = current_episodes.get(episode)
             if existing and existing["title"] == title and existing["script_file"] == expected_script_file:
                 continue
 
-            with project_change_source("filesystem"):
-                self.pm.sync_episode_from_script(project_name, script_path.name)
+            try:
+                with project_change_source("filesystem"):
+                    self.pm.sync_episode_from_script(project_name, script_path.name)
+            except ValueError as exc:
+                # 文件可能在候选快照后被外部改写；同步边界再次校验并 fail-safe 跳过，
+                # 避免污染 project.json 或让 SSE 扫描循环持续抖动 metadata.updated_at。
+                logger.warning(
+                    "剧集集号不一致，跳过同步 project=%s file=%s reason=%s",
+                    project_name,
+                    script_path.name,
+                    exc,
+                )
+                continue
             current_episodes[episode] = {
                 "title": title,
                 "script_file": expected_script_file,
@@ -362,19 +673,29 @@ class ProjectEventService:
                 "voice_style": str(data.get("voice_style") or ""),
                 "character_sheet": str(data.get("character_sheet") or ""),
                 "reference_image": str(data.get("reference_image") or ""),
+                "reference_audio": str(data.get("reference_audio") or ""),
+                "voice_updated_at": str(data.get("voice_updated_at") or ""),
+                "voice_notice_dismissed_at": str(data.get("voice_notice_dismissed_at") or ""),
             }
             for name, data in sorted(project.get("characters", {}).items())
             if isinstance(data, dict)
         }
 
-        clues = {
+        scenes = {
             name: {
-                "type": str(data.get("type") or ""),
                 "description": str(data.get("description") or ""),
-                "importance": str(data.get("importance") or ""),
-                "clue_sheet": str(data.get("clue_sheet") or ""),
+                "scene_sheet": str(data.get("scene_sheet") or ""),
             }
-            for name, data in sorted(project.get("clues", {}).items())
+            for name, data in sorted(project.get("scenes", {}).items())
+            if isinstance(data, dict)
+        }
+
+        props = {
+            name: {
+                "description": str(data.get("description") or ""),
+                "prop_sheet": str(data.get("prop_sheet") or ""),
+            }
+            for name, data in sorted(project.get("props", {}).items())
             if isinstance(data, dict)
         }
 
@@ -397,7 +718,7 @@ class ProjectEventService:
             for ep in sorted(
                 [
                     ep
-                    for ep in project.get("episodes", [])
+                    for ep in project.get("episodes") or []
                     if isinstance(ep, dict) and isinstance(ep.get("episode"), int)
                 ],
                 key=lambda value: value["episode"],
@@ -418,7 +739,8 @@ class ProjectEventService:
             "project": {
                 "meta": project_meta,
                 "characters": characters,
-                "clues": clues,
+                "scenes": scenes,
+                "props": props,
                 "overview": normalized_overview,
                 "episodes": episodes,
             },
@@ -426,13 +748,21 @@ class ProjectEventService:
         }
 
     def _normalize_script_snapshot(self, script: dict[str, Any]) -> dict[str, Any]:
+        # 取证解析：由剧本数据形状判别骨架种类（narration/drama 走 reference 时 content_mode 仍是
+        # narration/drama，按 content_mode 二值兜底会把 ad 的 shots 与 reference 的 video_units
+        # 全部漏读，差分恒空、分镜级事件从不发出）。键即条目数组键。
         content_mode = str(script.get("content_mode") or "narration")
-        raw_items = script.get("segments" if content_mode == "narration" else "scenes", [])
-        if not isinstance(raw_items, list):
+        raw_items, id_field, kind = resolve_kind_items(script)
+        chars_field = SKELETONS[kind].chars_field
+        if kind not in script:
             raw_items = []
-        id_field = "segment_id" if content_mode == "narration" else "scene_id"
-        chars_field = "characters_in_segment" if content_mode == "narration" else "characters_in_scene"
-        clues_field = "clues_in_segment" if content_mode == "narration" else "clues_in_scene"
+        elif not isinstance(raw_items, list):
+            logger.warning(
+                "剧本条目字段非列表，按空快照处理 kind=%s type=%s",
+                kind,
+                type(raw_items).__name__,
+            )
+            raw_items = []
 
         items: dict[str, Any] = {}
         for item in raw_items:
@@ -441,14 +771,17 @@ class ProjectEventService:
             item_id = str(item.get(id_field) or "")
             if not item_id:
                 continue
-            assets = item.get("generated_assets")
-            if not isinstance(assets, dict):
-                assets = {}
+            assets = get_generated_assets(item)
+            characters, scenes, props, products = self._item_entities(item, chars_field)
             items[item_id] = {
                 "duration_seconds": item.get("duration_seconds"),
+                "needs_replan": bool(item.get("needs_replan")),
                 "segment_break": bool(item.get("segment_break")),
-                "characters": sorted(str(name) for name in item.get(chars_field, []) or []),
-                "clues": sorted(str(name) for name in item.get(clues_field, []) or []),
+                "characters": characters,
+                "scenes": scenes,
+                "props": props,
+                "products": products,
+                "text": str(item.get("text") or "") if chars_field is None else "",
                 "image_prompt": item.get("image_prompt"),
                 "video_prompt": item.get("video_prompt"),
                 "generated_assets": {
@@ -463,8 +796,32 @@ class ProjectEventService:
             "episode": script.get("episode"),
             "title": str(script.get("title") or ""),
             "content_mode": content_mode,
+            "kind": kind,
             "items": items,
         }
+
+    @staticmethod
+    def _item_entities(
+        item: dict[str, Any], chars_field: str | None
+    ) -> tuple[list[str], list[str], list[str], list[str]]:
+        """条目出场的 (角色, 场景, 道具, 商品) 名单（各自排序、去重）。
+
+        ``chars_field`` 非 ``None`` 时角色读逐条字段、场景/道具读顶层 ``scenes`` / ``props``；为
+        ``None``（video_units 无逐条实体字段的显式缺位，见 ``SKELETONS``）时一律为空——参考生视频
+        的资产引用写在正文的 ``@[名称]`` 里，正文本身已进快照，实体名单再派生一遍只是同一处
+        改动的第二种说法。
+        """
+        if chars_field is not None:
+            chars_raw = item.get(chars_field)
+            scenes_raw = item.get("scenes")
+            props_raw = item.get("props")
+            products_raw = item.get("products_in_shot")
+            characters = sorted({str(name) for name in chars_raw}) if isinstance(chars_raw, list) else []
+            scenes = sorted({str(name) for name in scenes_raw}) if isinstance(scenes_raw, list) else []
+            props = sorted({str(name) for name in props_raw}) if isinstance(props_raw, list) else []
+            products = sorted({str(name) for name in products_raw}) if isinstance(products_raw, list) else []
+            return characters, scenes, props, products
+        return [], [], [], []
 
     def _diff_snapshots(
         self,
@@ -482,10 +839,18 @@ class ProjectEventService:
         )
         changes.extend(
             self._diff_named_entities(
-                entity_type="clue",
-                previous_items=previous["project"]["clues"],
-                current_items=current["project"]["clues"],
-                pane="clues",
+                entity_type="scene",
+                previous_items=previous["project"]["scenes"],
+                current_items=current["project"]["scenes"],
+                pane="scenes",
+            )
+        )
+        changes.extend(
+            self._diff_named_entities(
+                entity_type="prop",
+                previous_items=previous["project"]["props"],
+                current_items=current["project"]["props"],
+                pane="props",
             )
         )
         if previous["project"]["meta"] != current["project"]["meta"]:
@@ -494,7 +859,7 @@ class ProjectEventService:
                     "entity_type": "project",
                     "action": "updated",
                     "entity_id": "project",
-                    "label": "项目设置",
+                    **build_change_label("project_settings"),
                     "focus": None,
                     "important": False,
                 }
@@ -505,7 +870,7 @@ class ProjectEventService:
                     "entity_type": "overview",
                     "action": "updated",
                     "entity_id": "overview",
-                    "label": "项目概览",
+                    **build_change_label("overview"),
                     "focus": None,
                     "important": False,
                 }
@@ -535,32 +900,34 @@ class ProjectEventService:
         changes: list[dict[str, Any]] = []
         previous_keys = set(previous_items)
         current_keys = set(current_items)
-        for name in sorted(current_keys - previous_keys):
-            changes.append(
-                self._build_entity_change(
-                    entity_type=entity_type,
-                    action="created",
-                    entity_id=name,
-                    label=f"{'角色' if entity_type == 'character' else '线索'}「{name}」",
-                    focus={
-                        "pane": pane,
-                        "anchor_type": entity_type,
-                        "anchor_id": name,
-                    },
-                    important=True,
-                )
+        changes.extend(
+            self._build_entity_change(
+                entity_type=entity_type,
+                action="created",
+                entity_id=name,
+                label_key=f"named_entity_{entity_type}",
+                label_params={"id": name},
+                focus={
+                    "pane": pane,
+                    "anchor_type": entity_type,
+                    "anchor_id": name,
+                },
+                important=True,
             )
-        for name in sorted(previous_keys - current_keys):
-            changes.append(
-                self._build_entity_change(
-                    entity_type=entity_type,
-                    action="deleted",
-                    entity_id=name,
-                    label=f"{'角色' if entity_type == 'character' else '线索'}「{name}」",
-                    focus=None,
-                    important=False,
-                )
+            for name in sorted(current_keys - previous_keys)
+        )
+        changes.extend(
+            self._build_entity_change(
+                entity_type=entity_type,
+                action="deleted",
+                entity_id=name,
+                label_key=f"named_entity_{entity_type}",
+                label_params={"id": name},
+                focus=None,
+                important=False,
             )
+            for name in sorted(previous_keys - current_keys)
+        )
         for name in sorted(previous_keys & current_keys):
             if previous_items[name] == current_items[name]:
                 continue
@@ -569,7 +936,8 @@ class ProjectEventService:
                     entity_type=entity_type,
                     action="updated",
                     entity_id=name,
-                    label=f"{'角色' if entity_type == 'character' else '线索'}「{name}」",
+                    label_key=f"named_entity_{entity_type}",
+                    label_params={"id": name},
                     focus={
                         "pane": pane,
                         "anchor_type": entity_type,
@@ -595,7 +963,8 @@ class ProjectEventService:
                     entity_type="episode",
                     action="created",
                     entity_id=episode_key,
-                    label=f"第 {episode['episode']} 集",
+                    label_key="episode",
+                    label_params={"episode": episode["episode"]},
                     script_file=episode.get("script_file"),
                     episode=episode["episode"],
                     focus=None,
@@ -611,7 +980,8 @@ class ProjectEventService:
                     entity_type="episode",
                     action="updated",
                     entity_id=episode_key,
-                    label=f"第 {episode['episode']} 集",
+                    label_key="episode",
+                    label_params={"episode": episode["episode"]},
                     script_file=episode.get("script_file"),
                     episode=episode["episode"],
                     focus=None,
@@ -631,41 +1001,43 @@ class ProjectEventService:
             current_meta = current_scripts[script_file]
             previous_items = previous_meta.get("items", {})
             current_items = current_meta.get("items", {})
-            for item_id in sorted(set(current_items) - set(previous_items)):
-                changes.append(
-                    self._build_script_item_change(
-                        action="created",
-                        item_id=item_id,
-                        script_file=script_file,
-                        script_meta=current_meta,
-                        important=True,
-                    )
+            changes.extend(
+                self._build_script_item_change(
+                    action="created",
+                    item_id=item_id,
+                    script_file=script_file,
+                    script_meta=current_meta,
+                    important=True,
                 )
-            for item_id in sorted(set(previous_items) - set(current_items)):
-                changes.append(
-                    self._build_script_item_change(
-                        action="deleted",
-                        item_id=item_id,
-                        script_file=script_file,
-                        script_meta=previous_meta,
-                        important=False,
-                    )
+                for item_id in sorted(set(current_items) - set(previous_items))
+            )
+            changes.extend(
+                self._build_script_item_change(
+                    action="deleted",
+                    item_id=item_id,
+                    script_file=script_file,
+                    script_meta=previous_meta,
+                    important=False,
                 )
+                for item_id in sorted(set(previous_items) - set(current_items))
+            )
+            entity_type = self._script_item_entity_type(current_meta)
             for item_id in sorted(set(previous_items) & set(current_items)):
                 previous_item = previous_items[item_id]
                 current_item = current_items[item_id]
                 focus = self._build_script_item_focus(item_id, current_meta)
-                label = self._build_script_item_label(item_id, current_meta)
+                label_key = self._build_script_item_label_key(current_meta)
                 if self._became_truthy(
-                    previous_item["generated_assets"].get("storyboard_image"),
-                    current_item["generated_assets"].get("storyboard_image"),
+                    get_generated_assets(previous_item).get("storyboard_image"),
+                    get_generated_assets(current_item).get("storyboard_image"),
                 ):
                     changes.append(
                         self._build_entity_change(
-                            entity_type="segment",
+                            entity_type=entity_type,
                             action="storyboard_ready",
                             entity_id=item_id,
-                            label=label,
+                            label_key=label_key,
+                            label_params={"id": item_id},
                             script_file=script_file,
                             episode=current_meta.get("episode"),
                             focus=focus,
@@ -673,15 +1045,16 @@ class ProjectEventService:
                         )
                     )
                 if self._became_truthy(
-                    previous_item["generated_assets"].get("video_clip"),
-                    current_item["generated_assets"].get("video_clip"),
+                    get_generated_assets(previous_item).get("video_clip"),
+                    get_generated_assets(current_item).get("video_clip"),
                 ):
                     changes.append(
                         self._build_entity_change(
-                            entity_type="segment",
+                            entity_type=entity_type,
                             action="video_ready",
                             entity_id=item_id,
-                            label=label,
+                            label_key=label_key,
+                            label_params={"id": item_id},
                             script_file=script_file,
                             episode=current_meta.get("episode"),
                             focus=focus,
@@ -694,10 +1067,11 @@ class ProjectEventService:
                 if previous_body != current_body:
                     changes.append(
                         self._build_entity_change(
-                            entity_type="segment",
+                            entity_type=entity_type,
                             action="updated",
                             entity_id=item_id,
-                            label=label,
+                            label_key=label_key,
+                            label_params={"id": item_id},
                             script_file=script_file,
                             episode=current_meta.get("episode"),
                             focus=focus,
@@ -707,6 +1081,19 @@ class ProjectEventService:
         return changes
 
     @staticmethod
+    def _script_kind(script_meta: dict[str, Any]) -> str:
+        # 单一读取点，让名词/实体类型/锚点类型三者按同一 kind 归一，回退口径不会分叉。
+        return str(script_meta.get("kind") or "segments")
+
+    @staticmethod
+    def _script_item_entity_type(script_meta: dict[str, Any]) -> str:
+        return SKELETON_ENTITY_TYPES.get(ProjectEventService._script_kind(script_meta), "segment")
+
+    @staticmethod
+    def _script_item_anchor_type(script_meta: dict[str, Any]) -> str:
+        return SKELETON_ANCHOR_TYPES.get(ProjectEventService._script_kind(script_meta), "segment")
+
+    @staticmethod
     def _build_script_item_focus(
         item_id: str,
         script_meta: dict[str, Any],
@@ -714,15 +1101,13 @@ class ProjectEventService:
         return {
             "pane": "episode",
             "episode": script_meta.get("episode"),
-            "anchor_type": "segment",
+            "anchor_type": ProjectEventService._script_item_anchor_type(script_meta),
             "anchor_id": item_id,
         }
 
     @staticmethod
-    def _build_script_item_label(item_id: str, script_meta: dict[str, Any]) -> str:
-        content_mode = str(script_meta.get("content_mode") or "narration")
-        noun = "分镜" if content_mode == "narration" else "场景"
-        return f"{noun}「{item_id}」"
+    def _build_script_item_label_key(script_meta: dict[str, Any]) -> str:
+        return SKELETON_ITEM_LABEL_KEYS.get(ProjectEventService._script_kind(script_meta), "skeleton_segments")
 
     def _build_script_item_change(
         self,
@@ -735,10 +1120,11 @@ class ProjectEventService:
     ) -> dict[str, Any]:
         focus = self._build_script_item_focus(item_id, script_meta) if action != "deleted" else None
         return self._build_entity_change(
-            entity_type="segment",
+            entity_type=self._script_item_entity_type(script_meta),
             action=action,
             entity_id=item_id,
-            label=self._build_script_item_label(item_id, script_meta),
+            label_key=self._build_script_item_label_key(script_meta),
+            label_params={"id": item_id},
             script_file=script_file,
             episode=script_meta.get("episode"),
             focus=focus,
@@ -755,7 +1141,8 @@ class ProjectEventService:
         entity_type: str,
         action: str,
         entity_id: str,
-        label: str,
+        label_key: str,
+        label_params: dict[str, Any] | None = None,
         focus: dict[str, Any] | None,
         important: bool,
         script_file: str | None = None,
@@ -765,7 +1152,7 @@ class ProjectEventService:
             "entity_type": entity_type,
             "action": action,
             "entity_id": entity_id,
-            "label": label,
+            **build_change_label(label_key, **(label_params or {})),
             "focus": focus,
             "important": important,
         }

@@ -1,448 +1,385 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "wouter";
+import { useTranslation } from "react-i18next";
 import {
+  ChevronLeft,
   ChevronRight,
-  ChevronDown,
-  FileText,
-  Users,
-  Puzzle,
-  Film,
-  Circle,
-  User,
+  Clapperboard,
   LayoutDashboard,
-  Upload,
-  X,
+  BookOpen,
+  Users,
+  Landmark,
+  Package,
+  Plus,
+  Search,
+  ShoppingBag,
 } from "lucide-react";
 import { useProjectsStore } from "@/stores/projects-store";
+import { useCostStore } from "@/stores/cost-store";
 import { useAppStore } from "@/stores/app-store";
 import { API } from "@/api";
-
-// ---------------------------------------------------------------------------
-// CollapsibleSection — reusable accordion primitive
-// ---------------------------------------------------------------------------
-
-function CollapsibleSection({
-  title,
-  icon: Icon,
-  children,
-  defaultOpen = true,
-  action,
-}: {
-  title: string;
-  icon: React.ComponentType<{ className?: string }>;
-  children: React.ReactNode;
-  defaultOpen?: boolean;
-  action?: React.ReactNode;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
-
-  return (
-    <section>
-      <div className="flex w-full items-center">
-        <button
-          type="button"
-          onClick={() => setOpen(!open)}
-          className="flex flex-1 items-center gap-1.5 px-3 py-2 text-xs font-semibold uppercase tracking-wider text-gray-500 transition-colors hover:text-gray-400"
-        >
-          {open ? (
-            <ChevronDown className="h-3 w-3 shrink-0" />
-          ) : (
-            <ChevronRight className="h-3 w-3 shrink-0" />
-          )}
-          <Icon className="h-3.5 w-3.5 shrink-0" />
-          <span>{title}</span>
-        </button>
-        {action && <div className="pr-2">{action}</div>}
-      </div>
-      {open && <div className="pb-1">{children}</div>}
-    </section>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Status dot color mapping
-// ---------------------------------------------------------------------------
-
-const STATUS_DOT_CLASSES: Record<string, string> = {
-  draft: "text-gray-500",
-  in_production: "text-amber-500",
-  completed: "text-emerald-500",
-  missing: "text-red-500",
-};
-
-// ---------------------------------------------------------------------------
-// CharacterThumbnail — round avatar with fallback
-// ---------------------------------------------------------------------------
-
-function CharacterThumbnail({
-  name,
-  sheetPath,
-  projectName,
-}: {
-  name: string;
-  sheetPath: string | undefined;
-  projectName: string;
-}) {
-  const sheetFp = useProjectsStore((s) =>
-    sheetPath ? s.getAssetFingerprint(sheetPath) : null,
-  );
-  const [imgError, setImgError] = useState(false);
-
-  useEffect(() => {
-    setImgError(false);
-  }, [sheetFp, sheetPath]);
-
-  if (!sheetPath || imgError) {
-    return (
-      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-gray-700 text-gray-400">
-        <User className="h-3.5 w-3.5" />
-      </span>
-    );
-  }
-
-  return (
-    <img
-      src={API.getFileUrl(projectName, sheetPath, sheetFp)}
-      alt={name}
-      className="h-6 w-6 shrink-0 rounded-full object-cover"
-      onError={() => setImgError(true)}
-    />
-  );
-}
-
-// ---------------------------------------------------------------------------
-// ClueThumbnail — square icon with fallback
-// ---------------------------------------------------------------------------
-
-function ClueThumbnail({
-  name,
-  sheetPath,
-  projectName,
-}: {
-  name: string;
-  sheetPath: string | undefined;
-  projectName: string;
-}) {
-  const sheetFp = useProjectsStore((s) =>
-    sheetPath ? s.getAssetFingerprint(sheetPath) : null,
-  );
-  const [imgError, setImgError] = useState(false);
-
-  useEffect(() => {
-    setImgError(false);
-  }, [sheetFp, sheetPath]);
-
-  if (!sheetPath || imgError) {
-    return (
-      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-gray-700 text-gray-400">
-        <Puzzle className="h-3.5 w-3.5" />
-      </span>
-    );
-  }
-
-  return (
-    <img
-      src={API.getFileUrl(projectName, sheetPath, sheetFp)}
-      alt={name}
-      className="h-6 w-6 shrink-0 rounded object-cover"
-      onError={() => setImgError(true)}
-    />
-  );
-}
-
-// ---------------------------------------------------------------------------
-// EmptyState — shared empty placeholder
-// ---------------------------------------------------------------------------
-
-function EmptyState({ text }: { text: string }) {
-  return (
-    <p className="px-3 py-1.5 text-xs italic text-gray-600">{text}</p>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// AssetSidebar
-// ---------------------------------------------------------------------------
+import { useDemoWorkbench } from "@/onboarding/use-demo-workbench";
+import { isDemoProject } from "@/onboarding/demo-project";
+import { normalizeRoute } from "@/utils/generation-mode";
+import { EpisodeCard } from "./EpisodeCard";
 
 interface AssetSidebarProps {
   className?: string;
 }
 
+interface NavItem {
+  key: string;
+  path: string;
+  label: string;
+  icon: React.ComponentType<{ className?: string; style?: React.CSSProperties }>;
+  meta?: number;
+}
+
+/**
+ * 工作台侧栏 v3：
+ * - 工作区导航（5 个胶囊按钮：项目概览 / 源文件 / 角色集 / 场景库 / 道具库）
+ * - 分集列表（搜索 + 卡片列表，每张卡片含缩略+状态+进度+费用）
+ * - 折叠态（64px）：仅图标 + Ex 字符
+ */
 export function AssetSidebar({ className }: AssetSidebarProps) {
-  const { currentProjectData, currentProjectName } = useProjectsStore();
-  const sourceFilesVersion = useAppStore((s) => s.sourceFilesVersion);
+  const { t } = useTranslation(["common", "dashboard"]);
+  const { currentProjectName, currentProjectData } = useProjectsStore();
+  const debouncedFetchCost = useCostStore((s) => s.debouncedFetch);
   const [location, setLocation] = useLocation();
+  const [collapsed, setCollapsed] = useState(false);
+  const [search, setSearch] = useState("");
 
-  const characters = currentProjectData?.characters ?? {};
-  const clues = currentProjectData?.clues ?? {};
+  const characterCount = Object.keys(currentProjectData?.characters ?? {}).length;
+  const sceneCount = Object.keys(currentProjectData?.scenes ?? {}).length;
+  const propCount = Object.keys(currentProjectData?.props ?? {}).length;
+  const productCount = Object.keys(currentProjectData?.products ?? {}).length;
   const episodes = currentProjectData?.episodes ?? [];
-  const projectName = currentProjectName ?? "";
+  // 广告/短片项目恒单集：隐藏「集」语义（标题/计数/搜索/添加），直达唯一视频
+  const isAd = currentProjectData?.content_mode === "ad";
 
-  // 源文件列表
-  const [sourceFiles, setSourceFiles] = useState<string[]>([]);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const sourceFilesVersion = useAppStore((s) => s.sourceFilesVersion);
+  const [sourceCount, setSourceCount] = useState<number>(0);
 
-  const loadSourceFiles = useCallback(() => {
-    if (!projectName) {
-      setSourceFiles([]);
-      return;
-    }
-    API.listFiles(projectName)
-      .then((res) => {
-        const raw = res.files as unknown;
-        if (Array.isArray(raw)) {
-          setSourceFiles(raw);
-        } else if (raw && typeof raw === "object") {
-          const grouped = raw as Record<string, Array<{ name: string }>>;
-          setSourceFiles((grouped.source ?? []).map((f) => f.name));
-        }
-      })
-      .catch(() => {
-        setSourceFiles([]);
-      });
-  }, [projectName]);
+  // 演示项目没有服务端侧数据，源文件计数跳过（导航与分集列表照常渲染）
+  const demoMode = useDemoWorkbench();
 
   useEffect(() => {
-    loadSourceFiles();
-  }, [loadSourceFiles, sourceFilesVersion]);
+    if (currentProjectName) debouncedFetchCost(currentProjectName);
+  }, [currentProjectName, debouncedFetchCost]);
 
-  // 上传源文件
-  const handleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !projectName) return;
-    try {
-      await API.uploadFile(projectName, "source", file);
-      loadSourceFiles();
-      useAppStore.getState().invalidateSourceFiles();
-    } catch {
-      // 静默失败
-    }
-    // 重置 input 以允许再次选择同一文件
-    e.target.value = "";
-  }, [projectName, loadSourceFiles]);
+  useEffect(() => {
+    // demoMode 演示→真实切换时先于 store 变为 false，currentProjectName 单独判一次
+    // 兜住这一帧仍读到旧演示项目名的窗口，避免对不存在的演示项目发一次必然失败的请求。
+    if (!currentProjectName || demoMode || isDemoProject(currentProjectName)) return;
+    let cancelled = false;
+    API.listFiles(currentProjectName)
+      .then((res) => {
+        if (!cancelled) setSourceCount(res.files?.source?.length ?? 0);
+      })
+      .catch(() => {
+        // 失败时保留上一份成功值，避免把网络/权限错误伪装成 0
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentProjectName, sourceFilesVersion, demoMode]);
 
-  // 删除源文件
-  const handleDeleteFile = useCallback(async (filename: string) => {
-    if (!projectName) return;
-    if (!confirm(`确定要删除 "${filename}" 吗？`)) return;
-    try {
-      await API.deleteSourceFile(projectName, filename);
-      loadSourceFiles();
-      useAppStore.getState().invalidateSourceFiles();
-      // 如果当前正在查看该文件，返回概览
-      if (location === `/source/${encodeURIComponent(filename)}`) {
-        setLocation("/");
-      }
-    } catch {
-      // 静默失败
-    }
-  }, [projectName, loadSourceFiles, location, setLocation]);
+  // Derive active episode from `/episodes/:id`
+  const activeEp = useMemo(() => {
+    const m = location.match(/^\/episodes\/(\d+)/);
+    return m ? parseInt(m[1], 10) : null;
+  }, [location]);
 
-  const characterEntries = Object.entries(characters);
-  const clueEntries = Object.entries(clues);
+  const navItems: NavItem[] = [
+    { key: "overview", path: "/", label: t("dashboard:workspace_nav_overview"), icon: LayoutDashboard },
+    // 演示项目没有可切片的源文件，且后端不存在该项目，隐藏入口而非渲染必然报错的空页
+    ...(demoMode
+      ? []
+      : [
+          {
+            key: "source",
+            path: "/source",
+            label: t("dashboard:workspace_nav_source"),
+            icon: BookOpen,
+            meta: sourceCount,
+          },
+        ]),
+    {
+      key: "characters",
+      path: "/characters",
+      label: t("dashboard:workspace_nav_characters"),
+      icon: Users,
+      meta: characterCount,
+    },
+    {
+      key: "scenes",
+      path: "/scenes",
+      label: t("dashboard:workspace_nav_scenes"),
+      icon: Landmark,
+      meta: sceneCount,
+    },
+    {
+      key: "props",
+      path: "/props",
+      label: t("dashboard:workspace_nav_props"),
+      icon: Package,
+      meta: propCount,
+    },
+    // 商品资产仅广告/短片项目使用（v1 单商品设定），其余模式隐藏入口
+    ...(isAd
+      ? [
+          {
+            key: "products",
+            path: "/products",
+            label: t("dashboard:workspace_nav_products"),
+            icon: ShoppingBag,
+            meta: productCount,
+          },
+        ]
+      : []),
+  ];
 
-  // Check if a path is active (matches current nested location)
-  const isActive = (path: string) => location === path;
+  const isNavActive = (item: NavItem): boolean => {
+    if (item.path === "/") return location === "/";
+    return location === item.path || location.startsWith(item.path + "/");
+  };
+
+  // ad 隐藏搜索框，残留的 search state 不参与过滤，避免唯一视频入口被吞
+  const filteredEps = isAd
+    ? episodes
+    : episodes.filter(
+        (ep) => !search || ep.title.includes(search) || String(ep.episode).includes(search),
+      );
 
   return (
     <aside
-      className={`flex flex-col overflow-y-auto bg-gray-900 ${className ?? ""}`}
+      className={`flex flex-col overflow-hidden ${className ?? ""}`}
+      style={{
+        width: collapsed ? 64 : 256,
+        transition: "width .18s ease",
+        borderRight: "1px solid var(--color-hairline)",
+        background:
+          "linear-gradient(180deg, oklch(0.195 0.011 265 / 0.6), oklch(0.175 0.010 265 / 0.5))",
+        boxShadow: "inset -1px 0 0 oklch(1 0 0 / 0.015)",
+      }}
     >
-      {/* ---- Project Overview nav item ---- */}
-      <button
-        type="button"
-        onClick={() => setLocation("/")}
-        className={`flex w-full items-center gap-2 px-3 py-2.5 text-sm transition-colors ${
-          isActive("/")
-            ? "bg-gray-800 text-white"
-            : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
-        }`}
-      >
-        <LayoutDashboard className="h-4 w-4 shrink-0 text-indigo-400" />
-        <span className="font-medium">项目概览</span>
-      </button>
-
-      {/* ---- Divider ---- */}
-      <div className="mx-3 border-t border-gray-800" />
-
-      {/* ---- Section 1: Source Files ---- */}
-      <CollapsibleSection
-        title="源文件"
-        icon={FileText}
-        action={
-          <>
+      {/* ---- Workspace nav ---- */}
+      <div className="px-2.5 pb-1.5 pt-2.5">
+        {navItems.map((item) => {
+          const Icon = item.icon;
+          const active = isNavActive(item);
+          return (
             <button
+              key={item.key}
               type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="rounded p-1 text-gray-500 transition-colors hover:bg-gray-800 hover:text-gray-300"
-              title="上传源文件"
+              onClick={() => setLocation(item.path)}
+              title={collapsed ? item.label : ""}
+              aria-label={collapsed ? item.label : undefined}
+              className="relative mb-px flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 transition-colors focus-ring hover:bg-[oklch(0.26_0.012_265/0.5)]"
+              style={{
+                background: active
+                  ? "linear-gradient(90deg, var(--color-accent-soft), var(--color-accent-dim) 70%, transparent)"
+                  : "transparent",
+                color: active ? "var(--color-text)" : "var(--color-text-2)",
+              }}
             >
-              <Upload className="h-3.5 w-3.5" />
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".txt,.md,.doc,.docx"
-              onChange={handleUpload}
-              className="hidden"
-            />
-          </>
-        }
-      >
-        {sourceFiles.length === 0 ? (
-          <EmptyState text="暂无文件" />
-        ) : (
-          <ul>
-            {sourceFiles.map((name) => {
-              const filePath = `/source/${encodeURIComponent(name)}`;
-              const active = isActive(filePath);
-              return (
-                <li key={name}>
-                  <div
-                    className={`group flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors ${
-                      active
-                        ? "bg-gray-800 text-white"
-                        : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
-                    }`}
+              {active && (
+                <span
+                  className="absolute -left-px top-[7px] bottom-[7px] w-0.5 rounded"
+                  style={{
+                    background: "var(--color-accent)",
+                    boxShadow: "0 0 8px var(--color-accent-glow)",
+                  }}
+                />
+              )}
+              <span
+                className="grid w-4 shrink-0 place-items-center"
+                style={{ color: active ? "var(--color-accent-2)" : "var(--color-text-3)" }}
+              >
+                <Icon className="h-4 w-4" />
+              </span>
+              {!collapsed && (
+                <>
+                  <span
+                    className="flex-1 text-left text-[13px]"
+                    style={{
+                      fontWeight: active ? 600 : 500,
+                      letterSpacing: "-0.05px",
+                    }}
                   >
-                    <button
-                      type="button"
-                      onClick={() => setLocation(filePath)}
-                      className="flex flex-1 items-center gap-2 truncate text-left"
+                    {item.label}
+                  </span>
+                  {item.meta != null && (
+                    <span
+                      className="num rounded-[3px] px-1.5 py-px text-[10.5px]"
+                      style={{
+                        color: active ? "var(--color-text-3)" : "var(--color-text-4)",
+                        background: active ? "oklch(0 0 0 / 0.2)" : "transparent",
+                      }}
                     >
-                      <FileText className="h-3.5 w-3.5 shrink-0 text-gray-500" />
-                      <span className="truncate">{name}</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={(e) => { e.stopPropagation(); handleDeleteFile(name); }}
-                      className="shrink-0 rounded p-0.5 text-gray-600 opacity-0 transition-opacity hover:text-red-400 group-hover:opacity-100"
-                      title="删除文件"
-                    >
-                      <X className="h-3 w-3" />
-                    </button>
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </CollapsibleSection>
-
-      {/* ---- Divider ---- */}
-      <div className="mx-3 border-t border-gray-800" />
-
-      {/* ---- Section 2: Lorebook (Characters + Clues) ---- */}
-      <CollapsibleSection title="设定集" icon={Users} defaultOpen={true}>
-        {/* Characters sub-section */}
-        <div className="mb-1">
-          <div className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-gray-600">
-            <Users className="h-3 w-3" />
-            <span>角色</span>
-          </div>
-          {characterEntries.length === 0 ? (
-            <EmptyState text="暂无角色" />
-          ) : (
-            <ul>
-              {characterEntries.map(([name, char]) => (
-                <li key={name}>
-                  <button
-                    type="button"
-                    onClick={() => setLocation("/characters")}
-                    className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors ${
-                      isActive("/characters")
-                        ? "bg-gray-800 text-white"
-                        : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
-                    }`}
-                  >
-                    <CharacterThumbnail
-                      name={name}
-                      sheetPath={char.character_sheet}
-                      projectName={projectName}
-                    />
-                    <span className="truncate">{name}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-
-        {/* Clues sub-section */}
-        <div>
-          <div className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-gray-600">
-            <Puzzle className="h-3 w-3" />
-            <span>线索</span>
-          </div>
-          {clueEntries.length === 0 ? (
-            <EmptyState text="暂无线索" />
-          ) : (
-            <ul>
-              {clueEntries.map(([name, clue]) => (
-                <li key={name}>
-                  <button
-                    type="button"
-                    onClick={() => setLocation("/clues")}
-                    className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors ${
-                      isActive("/clues")
-                        ? "bg-gray-800 text-white"
-                        : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
-                    }`}
-                  >
-                    <ClueThumbnail
-                      name={name}
-                      sheetPath={clue.clue_sheet}
-                      projectName={projectName}
-                    />
-                    <span className="truncate">{name}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      </CollapsibleSection>
-
-      {/* ---- Divider ---- */}
-      <div className="mx-3 border-t border-gray-800" />
-
-      {/* ---- Section 3: Episodes ---- */}
-      <CollapsibleSection title="剧集" icon={Film}>
-        {episodes.length === 0 ? (
-          <EmptyState text="暂无剧集" />
-        ) : (
-          <ul>
-            {episodes.map((ep) => {
-              const episodePath = `/episodes/${ep.episode}`;
-              const active = isActive(episodePath);
-              const statusClass =
-                STATUS_DOT_CLASSES[ep.status ?? "draft"] ??
-                STATUS_DOT_CLASSES.draft;
-
-              return (
-                <li key={ep.episode}>
-                  <button
-                    type="button"
-                    onClick={() => setLocation(episodePath)}
-                    className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors ${
-                      active
-                        ? "bg-gray-800 text-white"
-                        : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
-                    }`}
-                  >
-                    <Circle
-                      className={`h-2.5 w-2.5 shrink-0 fill-current ${statusClass}`}
-                    />
-                    <span className="truncate">
-                      E{ep.episode}: {ep.title}
+                      {item.meta}
                     </span>
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </CollapsibleSection>
+                  )}
+                </>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      <div
+        className="mx-3.5 my-1 h-px"
+        style={{ background: "var(--color-hairline-soft)" }}
+      />
+
+      {/* ---- Episodes ---- */}
+      {!collapsed ? (
+        <>
+          <div className="flex items-center gap-2 px-3.5 pb-1.5 pt-2.5">
+            <span
+              className="text-[10.5px] font-bold uppercase"
+              style={{ color: "var(--color-text-4)", letterSpacing: "0.8px" }}
+            >
+              {isAd
+                ? t("dashboard:ad_video_section_title")
+                : t("dashboard:episodes_section_title")}
+            </span>
+            {!isAd && (
+              <>
+                <span className="num text-[10px]" style={{ color: "var(--color-text-4)" }}>
+                  {episodes.length}
+                </span>
+                <span className="flex-1" />
+                <button
+                  type="button"
+                  disabled
+                  aria-disabled="true"
+                  className="grid h-5 w-5 place-items-center rounded focus-ring disabled:cursor-not-allowed disabled:opacity-50"
+                  style={{
+                    background: "oklch(0.28 0.012 250 / 0.6)",
+                    color: "var(--color-text-3)",
+                  }}
+                  title={t("dashboard:add_episode_unavailable")}
+                  aria-label={t("dashboard:add_episode")}
+                >
+                  <Plus className="h-3 w-3" />
+                </button>
+              </>
+            )}
+          </div>
+
+          {!isAd && (
+            <div className="px-2.5 pb-2">
+              <div
+                className="flex items-center gap-1.5 rounded-md px-2 py-1.5"
+                style={{
+                  background: "oklch(0.16 0.010 250 / 0.6)",
+                  border: "1px solid var(--color-hairline)",
+                }}
+              >
+                <Search
+                  className="h-3 w-3 shrink-0"
+                  style={{ color: "var(--color-text-4)" }}
+                />
+                <input
+                  type="search"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder={t("dashboard:episode_search_placeholder")}
+                  aria-label={t("dashboard:episode_search_placeholder")}
+                  className="min-w-0 flex-1 bg-transparent text-xs outline-none focus-ring"
+                  style={{ color: "var(--color-text)" }}
+                />
+              </div>
+            </div>
+          )}
+
+          <div className="flex-1 overflow-y-auto px-2 pb-2.5">
+            {filteredEps.length === 0 ? (
+              <div
+                className="px-2 py-6 text-center text-[11px] italic"
+                style={{ color: "var(--color-text-4)" }}
+              >
+                {episodes.length === 0
+                  ? t("dashboard:no_episodes_yet")
+                  : t("dashboard:no_episode_search_results")}
+              </div>
+            ) : (
+              filteredEps.map((ep) => (
+                <EpisodeCard
+                  key={ep.episode}
+                  ep={ep}
+                  active={ep.episode === activeEp}
+                  onClick={() => setLocation(`/episodes/${ep.episode}`)}
+                  showEpisodeBadge={!isAd}
+                  fallbackTitle={isAd ? currentProjectData?.title : undefined}
+                  route={normalizeRoute(currentProjectData?.generation_mode)}
+                />
+              ))
+            )}
+          </div>
+        </>
+      ) : (
+        <div className="flex-1 overflow-y-auto px-2.5 py-1.5">
+          {filteredEps.map((ep) => {
+            const epLabel = isAd
+              ? t("dashboard:ad_video_section_title")
+              : t("dashboard:episode_collapsed_button_label", {
+                  episode: ep.episode,
+                  title: ep.title,
+                });
+            return (
+            <button
+              key={ep.episode}
+              type="button"
+              onClick={() => setLocation(`/episodes/${ep.episode}`)}
+              title={epLabel}
+              aria-label={epLabel}
+              className="num mb-[3px] flex h-9 w-full items-center justify-center rounded-md text-[11px] font-bold focus-ring"
+              style={{
+                background: ep.episode === activeEp ? "var(--color-accent-dim)" : "transparent",
+                color:
+                  ep.episode === activeEp
+                    ? "var(--color-accent-2)"
+                    : "var(--color-text-3)",
+              }}
+            >
+              {isAd ? <Clapperboard className="h-4 w-4" aria-hidden /> : `E${ep.episode}`}
+            </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ---- Collapse footer ---- */}
+      <div
+        className="flex items-center gap-2 px-2.5 py-2"
+        style={{
+          borderTop: "1px solid var(--color-hairline)",
+          background: "oklch(0.17 0.010 250 / 0.6)",
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => setCollapsed((c) => !c)}
+          className="grid h-7 w-7 place-items-center rounded-md focus-ring"
+          aria-expanded={!collapsed}
+          style={{
+            background: "oklch(0.24 0.012 250 / 0.5)",
+            color: "var(--color-text-3)",
+          }}
+          title={collapsed ? t("dashboard:sidebar_expand") : t("dashboard:sidebar_collapse")}
+          aria-label={
+            collapsed ? t("dashboard:sidebar_expand") : t("dashboard:sidebar_collapse")
+          }
+        >
+          {collapsed ? (
+            <ChevronRight className="h-3.5 w-3.5" />
+          ) : (
+            <ChevronLeft className="h-3.5 w-3.5" />
+          )}
+        </button>
+      </div>
     </aside>
   );
 }
